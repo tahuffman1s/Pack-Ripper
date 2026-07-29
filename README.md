@@ -190,7 +190,7 @@ Two details worth knowing:
 - **The request origin has to be right.** SvelteKit refuses any POST whose `Origin` header
   disagrees with the origin it believes it is serving, and a mismatch breaks every login and
   purchase while pages keep loading normally. `run.sh` pins `ORIGIN` to
-  `http://localhost:PORT`; in Azure `azure/deploy.sh` pins it to the real `https://` hostname.
+  `http://localhost:PORT`; in Azure it has to be set to the real `https://` hostname.
 
 The runtime image is ~174 MB and contains no `node_modules` at all: adapter-node bundles the
 whole server into `build/`, whose only imports are `node:` builtins.
@@ -221,85 +221,66 @@ image everywhere, pulling it instead of building when it is missing.
 ## Hosting it in Azure
 
 The public copy runs on **Azure Container Apps**, pulling that same GHCR image. Azure
-terminates TLS and hands out a stable hostname, so there is no tunnel and nothing to
-re-publish when it restarts:
+terminates TLS and hands out a stable hostname, which is why there is no tunnel any more:
 
 ```
 https://packripper.<generated>.<region>.azurecontainerapps.io
 ```
 
-One script owns the whole thing, and it is idempotent — run it again to ship a new image or
-change a setting:
+The app itself is created and managed in the Portal — this repo does not script it. What the
+pipeline gives you is a fresh image in the registry; wiring it up is these settings:
 
-```bash
-az login                     # once
-azure/deploy.sh              # create or update everything, then print the URL
-azure/deploy.sh logs         # follow the container log
-azure/deploy.sh status       # revision, replica, image, provisioning state
-azure/deploy.sh restart
-CONFIRM=1 azure/deploy.sh destroy    # delete the resource group and stop the meter
-```
+| Portal field | Value |
+|---|---|
+| Image source | Docker Hub or other registries |
+| Registry login server | `ghcr.io` |
+| Authentication | Public — the package is public, no credentials |
+| Image and tag | `tahuffman1s/pack-ripper:sha-<short>` |
+| Ingress | Enabled, accepting traffic from anywhere |
+| Target port | **3000** |
+| CPU / memory | 0.5 / 1 GiB |
+| Min / max replicas | **1 / 1** |
 
-No Azure CLI installed? `sudo dnf install azure-cli`, or skip the install and run the script
-in [Cloud Shell](https://shell.azure.com), which has it already.
+Port 3000 is consistent in all three places that matter: `EXPOSE 3000` and `ENV PORT=3000` in
+the Dockerfile, and the ingress target port. Azure serves 443 publicly and forwards to 3000.
 
-What it creates, and why each piece is the way it is:
+Four things the create form will not prompt for, each of which breaks something real:
 
-- **A resource group** (`packripper-rg`, `eastus`) holding everything, so `destroy` is one
-  call and nothing is left billing quietly. Override with `RG=` / `LOCATION=`.
-- **A Container Apps environment** with `--logs-destination none`. That skips the Log
-  Analytics workspace Azure would otherwise create and bill for; `azure/deploy.sh logs`
-  streams from the container itself and does not need it.
-- **A storage account and one 5 GiB file share**, mounted at `/app/.data`. That is the whole
-  database — accounts, collections, wallets, the serial-number ledger — and it survives every
-  deploy, revision and restart.
-- **`.cache` deliberately left on local disk.** It is ~100 MB of regenerated Scryfall,
-  MTGJSON and TCGplayer data with its own TTLs, read as thousands of small files, which is
-  exactly what SMB is worst at. Keeping it local costs a slow first minute after each deploy —
-  the startup probe budgets five minutes for it — and makes every request after that fast.
-- **Exactly one replica**, `minReplicas: 1` and `maxReplicas: 1`. `db.js` keeps the database
-  in memory and flushes it to a single file, so a second replica would not see the first one's
-  writes and would overwrite them. Scaling this app means a real database first, not a bigger
-  `maxReplicas`.
-- **Always on**, because scaling to zero would mean the first visitor after an idle period
-  waits out a cold start. At 0.5 vCPU / 1 GiB that is roughly $10–15 a month of credits;
-  Container Apps bills per second, so `destroy` genuinely stops it.
-- **`ORIGIN` pinned** to `https://<the app's hostname>`, worked out before the app is created
-  from the environment's default domain. Get this wrong and pages still render while every
-  login and purchase fails the CSRF check.
+- **`ORIGIN` must be set** to `https://<the app's hostname>`, after creation once you know it.
+  SvelteKit refuses any POST whose `Origin` header disagrees with the origin it believes it is
+  serving, so a missing or wrong value does not break pages — it breaks every login and every
+  purchase while everything keeps looking fine. The rest of the environment is
+  `NODE_ENV=production`, `HOST=0.0.0.0`, `PORT=3000`, `BODY_SIZE_LIMIT=2M`.
+- **A volume mounted at `/app/.data`** (Azure Files). That is the entire database — accounts,
+  collections, wallets, the serial-number ledger. Without it, every revision and every restart
+  starts empty.
+- **Do not mount `.cache`.** It is ~100 MB of regenerated Scryfall, MTGJSON and TCGplayer data
+  with its own TTLs, read as thousands of small files, which is what SMB is worst at. Left on
+  local disk it costs a slow first minute after a deploy and is fast for every request after.
+- **Exactly one replica.** `db.js` keeps the database in memory and flushes it to a single
+  file, so a second replica would not see the first one's writes and would overwrite them.
+  Scaling this app means a real database first, not a bigger `maxReplicas`.
 
-### Deploying on push
+A health probe on `/api/health` is worth adding, with a **startup** budget of about five
+minutes: a fresh revision has an empty `.cache`, and the first request fetches the Scryfall set
+list and probes ~55 sets for sealed prices before anything is served. A tighter budget makes
+the platform decide the container is broken and restart it in a loop.
 
-`.github/workflows/deploy-azure.yml` rolls each successful image build out to Azure, deploying
-the immutable `sha-<short>` tag rather than `latest` so what is running is always identifiable
-and a rollback is one `workflow_dispatch` with an older tag. It waits for `/api/health` to
-answer 200 and fails the run if it never does.
+At 0.5 vCPU / 1 GiB always on, expect roughly $10–15 a month against your credits. Container
+Apps bills per second, so deleting the resource group genuinely stops the meter.
 
-It stays dormant until three repository variables exist. To set them up:
+### Shipping a new build
 
-```bash
-azure/github-oidc.sh
-```
+The pipeline builds and pushes; it does not deploy. **Container Apps will not pull a new tag on
+its own** — even pushing a new `latest` leaves the running revision exactly where it is. To pick
+up a build: Container App → Revisions → *Create new revision*, change the tag, create.
 
-That creates an Entra app registration, a federated credential trusted **only** for pushes to
-this repo's `main`, and a Contributor role assignment scoped to the resource group and nothing
-wider. GitHub exchanges its own short-lived OIDC token for an Azure one at deploy time, so
-there is no client secret to leak or rotate — the three values it prints are identifiers, not
-credentials. If your account cannot create app registrations, skip it and run
-`azure/deploy.sh` by hand when you want to ship.
+Each run's summary in Actions prints the registry, the `image:tag` and the port, formatted to be
+pasted straight into that form.
 
-### A custom domain
-
-Container Apps will serve one with a free managed certificate:
-
-```bash
-az containerapp hostname add      -n packripper -g packripper-rg --hostname packripper.example.com
-az containerapp ssl upload        # or: az containerapp hostname bind --validation-method CNAME
-```
-
-Then set `ORIGIN` to that hostname — `ORIGIN=https://packripper.example.com azure/deploy.sh`
-will not do it for you, because the script derives `ORIGIN` from the Azure hostname; edit
-`write_spec` or pass `ORIGIN` through if you go this route.
+Deploy the `sha-<short>` tag rather than `latest`. Both point at the same build, but with an
+immutable tag you can tell from the Portal which commit a revision is running, and a rollback is
+just creating a revision on an older tag — every one of them is still in the registry.
 
 ## Project layout
 
@@ -353,12 +334,8 @@ scripts/
   verify-slots.mjs        exact slot RTP / paytable verification
   verify-blackjack.mjs    hand evaluation, shuffle bias, measured house edge
   measure-sealed-premium.mjs  re-derives the vintage sealed premium from live prices
-azure/
-  deploy.sh               create or update the Container App (idempotent)
-  github-oidc.sh          one-time trust so Actions can deploy without a secret
 .github/workflows/
   publish-image.yml       build + push ghcr.io/tahuffman1s/pack-ripper
-  deploy-azure.yml        roll each built image out to Container Apps
 ```
 
 ## Notes & knobs

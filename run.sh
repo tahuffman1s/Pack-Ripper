@@ -2,12 +2,13 @@
 #
 # PackRipper container runner — local only.
 #
-# Public hosting lives in Azure now (see azure/deploy.sh and the README); this
-# script is for running the same image on this machine. It drives podman or
-# docker directly rather than compose, because podman ships without a compose
-# provider and this machine has none: `podman compose` here fails with "looking
-# up compose provider failed". docker-compose.yml is still in the repo for
-# anyone who does have one. This script needs neither.
+# Public hosting lives in Azure Container Apps now, managed in the Portal (the
+# README lists the settings it needs). This script runs the same image on this
+# machine. It drives podman or docker directly rather than compose, because
+# podman ships without a compose provider and this machine has none: `podman
+# compose` here fails with "looking up compose provider failed".
+# docker-compose.yml is still in the repo for anyone who does have one. This
+# script needs neither.
 #
 #   ./run.sh              start the app on http://localhost:PORT
 #   ./run.sh down         stop and remove the container
@@ -175,7 +176,7 @@ wait_for_app() {
 
 print_url() {
 	printf '\n  %sLocal:%s  http://localhost:%s\n' "$B" "$N" "$PORT"
-	printf '  %s(public hosting is in Azure — see azure/deploy.sh)%s\n\n' "$DIM" "$N"
+	printf '  %s(public hosting is Azure Container Apps — see the README)%s\n\n' "$DIM" "$N"
 }
 
 # ── commands ───────────────────────────────────────────────────

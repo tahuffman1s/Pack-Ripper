@@ -1,7 +1,11 @@
-# Build the runtime image and push it to this repo's GitHub Container Registry,
-# so `./run.sh pull` can fetch it instead of building locally:
+# Build the runtime image on every push and push it to this repo's GitHub
+# Container Registry:
 #
 #   ghcr.io/tahuffman1s/pack-ripper:latest
+#
+# That is the whole pipeline. Nothing here deploys: the Azure Container App is
+# managed by hand, and a new tag in the registry does not restart it on its own —
+# see the run summary, which prints the exact strings the Portal asks for.
 #
 # GHCR needs no secrets — the automatic GITHUB_TOKEN can write packages as long
 # as the job asks for the permission below. The package took this repo's public
@@ -13,12 +17,10 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    # The image contains none of these, so a doc edit or a deploy-script tweak
-    # should not spend five minutes rebuilding it.
+    # The image contains none of this, so a doc edit should not spend five
+    # minutes rebuilding it.
     paths-ignore:
-      - 'azure/**'
       - 'README.md'
-      - '.github/workflows/deploy-azure.yml'
   workflow_dispatch:
 
 concurrency:
@@ -66,12 +68,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Deploying is manual, so the summary is written to be pasted from: the
+      # Portal's "create a new revision" form asks for the registry, the image
+      # and tag, and the target port as three separate fields.
       - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
+          set -euo pipefail
+          # The immutable one. Deploying `latest` works but leaves you unable to
+          # tell which build a running revision actually is.
+          sha_tag=sha-${GITHUB_SHA:0:7}
+          image=ghcr.io/${GITHUB_REPOSITORY,,}
           {
             echo '### Pushed'
             echo
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            echo "$TAGS"
             echo '```'
+            echo
+            echo '### To deploy this build'
+            echo
+            echo '| Portal field | Value |'
+            echo '| --- | --- |'
+            echo '| Image source | Docker Hub or other registries |'
+            echo '| Registry login server | `ghcr.io` |'
+            echo '| Authentication | Public |'
+            echo "| Image and tag | \`${image#ghcr.io/}:$sha_tag\` |"
+            echo '| Target port | `3000` |'
+            echo
+            echo "Container Apps does not pull a new tag by itself — create a new revision."
           } >> "$GITHUB_STEP_SUMMARY"

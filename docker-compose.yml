@@ -1,7 +1,7 @@
 # Optional convenience file for running the app on this machine. `run.sh` does
 # the same thing with plain podman/docker commands and needs no compose provider
 # installed — this machine has none, so run.sh is the path that works out of the
-# box. Public hosting is Azure Container Apps; see azure/deploy.sh.
+# box. Public hosting is Azure Container Apps, managed in the Portal.
 #
 #   docker compose up -d        # http://localhost:3000
 
