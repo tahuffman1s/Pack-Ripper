@@ -74,6 +74,30 @@ async function companionIndex(code) {
 
 const BASIC_LAND = /^Basic (Snow )?Land/i;
 
+/** Reveal order: build from filler to payoff, the way a pack actually reads. */
+const TIER = { land: 0, common: 1, uncommon: 2, wildcard: 3, special: 4, bonus: 5, rare: 6, unknown: 3 };
+
+/** Where a slot of this kind sits in the reveal, foil variants just behind. */
+export function slotTier(kind, foil) {
+	return (TIER[kind] ?? 3) + (foil ? 0.5 : 0);
+}
+
+/**
+ * Slot kind of a single card, from its own type and rarity.
+ *
+ * Used where a sheet is not a rarity slot at all: a `fixed` sheet is a
+ * preconstructed deck taken in full, so its cards have to be classified one by
+ * one rather than by what the sheet looks like as a whole.
+ * @param {{t?:string, r?:string}} fact
+ */
+export function cardSlotKind(fact) {
+	if (BASIC_LAND.test(fact?.t || '')) return 'land';
+	const r = fact?.r;
+	if (r === 'mythic' || r === 'rare') return 'rare';
+	if (r === 'uncommon' || r === 'common') return r;
+	return 'wildcard';
+}
+
 /**
  * Classify a sheet by what is actually on it.
  * @returns {{kind:string, tier:number, rarityMix:Record<string,number>, foreign:number}}
@@ -109,15 +133,10 @@ export function classifySheet(sheet, facts, packSetCode) {
 	else if (p('special') + p('bonus') >= 0.5) kind = 'special';
 	else kind = 'wildcard';
 
-	// Reveal order: build from filler to payoff, the way a pack actually reads.
-	const TIER = { land: 0, common: 1, uncommon: 2, wildcard: 3, special: 4, bonus: 5, rare: 6, unknown: 3 };
-	let tier = TIER[kind] ?? 3;
-	if (sheet.foil) tier += 0.5;
-
-	return { kind, tier, rarityMix: mix, foreign };
+	return { kind, tier: slotTier(kind, sheet.foil), rarityMix: mix, foreign };
 }
 
-function labelFor(kind, foil) {
+export function labelFor(kind, foil) {
 	const base = {
 		land: 'Land',
 		common: 'Common',

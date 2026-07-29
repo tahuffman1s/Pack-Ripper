@@ -1,8 +1,7 @@
 <script>
-	import { enhance } from '$app/forms';
 	import { invalidateAll } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { formatGold, formatUsd } from '$lib/economy.js';
+	import BuyTile from '$lib/components/BuyTile.svelte';
 	import { PACK_TYPES } from '$lib/packs.js';
 
 	let { data } = $props();
@@ -35,6 +34,29 @@
 		toast = { msg, ok };
 		clearTimeout(toastTimer);
 		toastTimer = setTimeout(() => (toast = null), 3200);
+	}
+
+	/** One handler for every buy tile — the tile tells us what it just ordered. */
+	function bought(meta) {
+		return async (result, { qty, packs }) => {
+			buying = null;
+			if (result.type === 'success' && result.data?.success) {
+				if (meta.kind === 'box') {
+					showToast(
+						`${qty === 1 ? 'Box' : `${qty} boxes`} secured — ${packs.toLocaleString()} packs in your vault.`
+					);
+				} else {
+					showToast(
+						qty === 1
+							? `${meta.name} added to your vault.`
+							: `${qty} ${meta.name}s added to your vault.`
+					);
+				}
+				await invalidateAll();
+			} else if (result.type === 'failure') {
+				showToast(result.data?.error || 'Purchase failed.', false);
+			}
+		};
 	}
 </script>
 
@@ -83,74 +105,35 @@
 				<p class="text-sm text-base-content/60 -mt-1">{g.meta.blurb}</p>
 
 				<div class="grid grid-cols-2 gap-2 mt-1">
-					<!-- Single pack -->
 					{#if g.pack}
-						<form
-							method="POST" action="?/buy"
-							use:enhance={() => {
-								buying = g.packTypeId + ':pack';
-								return async ({ result }) => {
-									buying = null;
-									if (result.type === 'success' && result.data?.success) {
-										showToast(`Ripped open? Not yet — ${g.meta.name} added to your vault.`);
-										await invalidateAll();
-									} else if (result.type === 'failure') {
-										showToast(result.data?.error || 'Purchase failed.', false);
-									}
-								};
-							}}
-						>
-							<input type="hidden" name="setCode" value={data.set.code} />
-							<input type="hidden" name="packTypeId" value={g.packTypeId} />
-							<input type="hidden" name="kind" value="pack" />
-							<button
-								class="btn {ac.btn} w-full flex-col h-auto py-2.5 gap-0.5 {gold < g.pack.priceGold || data.set.unreleased ? 'btn-disabled' : ''}"
-								disabled={gold < g.pack.priceGold || buying || data.set.unreleased}
-							>
-								{#if buying === g.packTypeId + ':pack'}
-									<span class="loading loading-spinner loading-sm"></span>
-								{:else}
-									<span class="text-xs opacity-80">1 Pack</span>
-									<span class="font-bold">🪙 {formatGold(g.pack.priceGold)}</span>
-									<span class="text-[0.6rem] opacity-70">{g.pack.live ? '' : '≈'}{formatUsd(g.pack.priceUsd)}</span>
-								{/if}
-							</button>
-						</form>
+						<BuyTile
+							product={g.pack}
+							setCode={data.set.code}
+							label="Pack"
+							accentBtn={ac.btn}
+							{gold}
+							maxBuyPacks={data.maxBuyPacks}
+							disabled={data.set.unreleased}
+							busy={buying === g.packTypeId + ':pack'}
+							onsubmit={() => (buying = g.packTypeId + ':pack')}
+							onresult={bought({ kind: 'pack', name: g.meta.name })}
+						/>
 					{/if}
 
-					<!-- Box -->
 					{#if g.box}
-						<form
-							method="POST" action="?/buy"
-							use:enhance={() => {
-								buying = g.packTypeId + ':box';
-								return async ({ result }) => {
-									buying = null;
-									if (result.type === 'success' && result.data?.success) {
-										showToast(`Box secured — ${g.box.boxSize} ${g.meta.name}s in your vault.`);
-										await invalidateAll();
-									} else if (result.type === 'failure') {
-										showToast(result.data?.error || 'Purchase failed.', false);
-									}
-								};
-							}}
-						>
-							<input type="hidden" name="setCode" value={data.set.code} />
-							<input type="hidden" name="packTypeId" value={g.packTypeId} />
-							<input type="hidden" name="kind" value="box" />
-							<button
-								class="btn btn-outline {ac.btn} w-full flex-col h-auto py-2.5 gap-0.5 {gold < g.box.priceGold || data.set.unreleased ? 'btn-disabled' : ''}"
-								disabled={gold < g.box.priceGold || buying || data.set.unreleased}
-							>
-								{#if buying === g.packTypeId + ':box'}
-									<span class="loading loading-spinner loading-sm"></span>
-								{:else}
-									<span class="text-xs opacity-80">Box · {g.box.boxSize} packs</span>
-									<span class="font-bold">🪙 {formatGold(g.box.priceGold)}</span>
-									<span class="text-[0.6rem] opacity-70">{g.box.live ? '' : '≈'}{formatUsd(g.box.priceUsd)}</span>
-								{/if}
-							</button>
-						</form>
+						<BuyTile
+							product={g.box}
+							setCode={data.set.code}
+							label="Box · {g.box.boxSize} packs"
+							accentBtn={ac.btn}
+							outline
+							{gold}
+							maxBuyPacks={data.maxBuyPacks}
+							disabled={data.set.unreleased}
+							busy={buying === g.packTypeId + ':box'}
+							onsubmit={() => (buying = g.packTypeId + ':box')}
+							onresult={bought({ kind: 'box', name: g.meta.name })}
+						/>
 					{/if}
 				</div>
 			</div>

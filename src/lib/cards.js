@@ -6,6 +6,8 @@ export const RARITY = {
 	uncommon: { label: 'Uncommon', text: 'text-slate-300', badge: 'badge-ghost', ring: '', order: 2 },
 	common: { label: 'Common', text: 'text-base-content/70', badge: 'badge-ghost', ring: '', order: 1 },
 	art: { label: 'Art Card', text: 'text-secondary', badge: 'badge-secondary', ring: '', order: 0 },
+	// The card that names a Jumpstart theme deck. Not a game card, so not a rarity.
+	front: { label: 'Front Card', text: 'text-success', badge: 'badge-success', ring: '', order: 0 },
 	token: { label: 'Token', text: 'text-base-content/50', badge: 'badge-ghost', ring: '', order: 0 },
 	special: { label: 'Special', text: 'text-secondary', badge: 'badge-secondary', ring: '', order: 0 }
 };
@@ -19,12 +21,15 @@ export function cardImage(card, size = 'normal') {
 	return card?.images?.[size] || card?.images?.normal || card?.images?.small || null;
 }
 
+// Both accept a row that already carries the gold figure. The collection screen
+// projects it in server-side (see collection/+page.server.js) so ten thousand
+// tiles and a sort comparator are not each re-deriving it from `valueUsd`.
 export function marketGold(card) {
-	return cardMarketGold(card?.valueUsd ?? 0);
+	return card?.marketGold ?? cardMarketGold(card?.valueUsd ?? 0);
 }
 
 export function sellGold(card) {
-	return cardSellGold(card?.valueUsd ?? 0);
+	return card?.sellGold ?? cardSellGold(card?.valueUsd ?? 0);
 }
 
 // ── Treatments ─────────────────────────────────────────────────

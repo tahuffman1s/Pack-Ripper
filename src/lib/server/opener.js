@@ -1,8 +1,8 @@
 import { makeId } from './db.js';
 import { PACK_TYPES, VARIANT_PREFERENCE, isExcludedVariant, eraTemplate, SLOT_LABELS } from '../packs.js';
 import { generateFromVariant, makeRng } from '../collate.js';
-import { getCollation } from './collation.js';
-import { getSetPool, getSetPrints, resolveCardsByIds, poolIsUsable } from './scryfall.js';
+import { getCollation, cardSlotKind, slotTier, labelFor } from './collation.js';
+import { getAllSets, getSetPool, getSetPrints, resolveCardsByIds, poolIsUsable } from './scryfall.js';
 import { pickSerial, serializedFloorUsd, serialRunFor, isSerializedCard } from '../serialized.js';
 import { observedSerializedStats, modelledInSheets } from './serializedStats.js';
 import { nearestCollation, structureOf, pickStructureConfig } from './neighbour.js';
@@ -236,7 +236,17 @@ async function generateFromCollation(slice, packTypeId, rng) {
 
 		// Some sets carry the basic on the common sheet; it is still the land slot.
 		const isBasic = /^Basic (Snow )?Land/i.test(card.typeLine || fact.t || '');
-		const kind = serialized ? 'serialized' : isBasic ? 'land' : sheet?.kind || 'unknown';
+		// A `fixed` sheet is a preconstructed deck rather than a rarity slot, so the
+		// sheet's own classification says nothing useful about any one card on it:
+		// every card in a Jumpstart theme deck would otherwise read "Wildcard".
+		// Take the slot from the card itself, so the pack reads by rarity.
+		const kind = serialized
+			? 'serialized'
+			: isBasic
+				? 'land'
+				: sheet?.fixed
+					? cardSlotKind(fact)
+					: sheet?.kind || 'unknown';
 
 		cards.push(
 			makeInstance(card, {
@@ -248,8 +258,10 @@ async function generateFromCollation(slice, packTypeId, rng) {
 						? p.foil
 							? 'Foil Land'
 							: 'Land'
-						: sheet?.label || 'Card',
-				tier: serialized ? 9 : sheet?.tier ?? 1,
+						: sheet?.fixed
+							? labelFor(kind, p.foil)
+							: sheet?.label || 'Card',
+				tier: serialized ? 9 : sheet?.fixed ? slotTier(kind, p.foil) : sheet?.tier ?? 1,
 				sheet: p.sheet,
 				fromSet: isForeign ? fact.e : null,
 				serialOf,
@@ -258,9 +270,15 @@ async function generateFromCollation(slice, packTypeId, rng) {
 		);
 	}
 
-	// Collector Boosters are all premium cards, and a Mystery Booster is exactly
-	// one card from each of its print sheets — neither carries a token or ad card.
-	if (packTypeId !== 'collector' && packTypeId !== 'mystery') {
+	// A Jumpstart pack is a twenty-card deck plus the card that names the theme —
+	// not twenty cards plus a token, which is a 21-card pack containing something
+	// no Jumpstart booster has ever held.
+	if (packTypeId === 'jumpstart') {
+		const front = await drawFrontCard(slice, themeKeysOf(picked, variant));
+		if (front) cards.push(front);
+	} else if (packTypeId !== 'collector' && packTypeId !== 'mystery') {
+		// Collector Boosters are all premium cards, and a Mystery Booster is exactly
+		// one card from each of its print sheets — neither carries a token or ad card.
 		const extra = await drawNonPlayable(slice, packTypeId, rng);
 		if (extra) cards.push(extra);
 	}
@@ -274,6 +292,95 @@ async function generateFromCollation(slice, packTypeId, rng) {
 		source: 'mtgjson',
 		cards
 	};
+}
+
+/**
+ * The theme a Jumpstart pack was built from, read off its sheet names.
+ *
+ * MTGJSON names a Jumpstart deck's sheet after the theme in camelCase, adding a
+ * variant number when a theme has more than one deck and a `Foils` suffix for
+ * the deck's foil basics: `aboveTheClouds1`, `arcaneMischief`,
+ * `arcaneMischiefFoils`. Stripping those leaves the theme itself.
+ */
+function themeKeysOf(picked, variant) {
+	const keys = [];
+	for (const name of new Set(picked.map((p) => p.sheet))) {
+		if (!variant.sheets[name]?.fixed) continue;
+		keys.push(name.replace(/Foils?$/, '').replace(/\d+$/, ''));
+	}
+	return keys;
+}
+
+/** Compare theme names ignoring case and punctuation: treeHugging = Tree-Hugging. */
+function themeKey(s) {
+	return String(s || '')
+		.toLowerCase()
+		.replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * The set holding a Jumpstart release's front cards, or null.
+ *
+ * Wizards prints one front card per theme, and Scryfall files them in a
+ * companion set named "<set> Jumpstart Front Cards" — or "<set> Front Cards"
+ * when the Jumpstart release stands alone, so "Jumpstart 2022" pairs with
+ * "Jumpstart 2022 Front Cards". That naming is the same fingerprint catalog.js
+ * reads to decide which sets sold Jumpstart Boosters in the first place.
+ */
+async function frontCardSetCode(slice) {
+	let sets;
+	try {
+		sets = await getAllSets();
+	} catch {
+		return null;
+	}
+	const want = new Set([
+		`${slice.name} front cards`.toLowerCase(),
+		`${slice.name} jumpstart front cards`.toLowerCase()
+	]);
+	const hit = (sets || []).find((s) => want.has(String(s.name || '').toLowerCase()));
+	return hit?.code || null;
+}
+
+/**
+ * The themed front card a Jumpstart pack ships with, in place of the token every
+ * other product carries. Names match the sheet name once case and punctuation
+ * are dropped (`treeHugging1` -> "Tree-Hugging"), so no lookup table is needed.
+ * Returns null when the release has no front-card set — then the pack is simply
+ * its twenty cards, which is still right.
+ */
+async function drawFrontCard(slice, keys) {
+	if (!keys.length) return null;
+	const code = await frontCardSetCode(slice);
+	if (!code) return null;
+
+	let prints;
+	try {
+		prints = await getSetPrints(code);
+	} catch {
+		return null;
+	}
+	const byTheme = new Map();
+	for (const c of Object.values(prints || {})) byTheme.set(themeKey(c.name), c);
+
+	for (const k of keys) {
+		const card = byTheme.get(themeKey(k));
+		if (!card) continue;
+		return makeInstance(
+			// A front card is not a game card and carries no rarity of its own;
+			// labelling it "Common" would misreport the pack.
+			{ ...card, rarity: 'front' },
+			{
+				finish: 'nonfoil',
+				slot: 'nonplayable',
+				slotLabel: 'Front Card',
+				tier: 0,
+				sheet: null,
+				estimated: false
+			}
+		);
+	}
+	return null;
 }
 
 /**
@@ -337,6 +444,27 @@ function asNonPlayable(card) {
 
 // ── The fallback path ──────────────────────────────────────────
 
+/**
+ * Products whose packs hold only plain printings.
+ *
+ * A Jumpstart deck is a preconstructed list of ordinary cards. Across all seven
+ * Jumpstart products MTGJSON has sheets for — JMP, J22, J25 and the DMU, BRO,
+ * ONE and MOM companion boosters — not one non-land card on any theme-deck sheet
+ * carries a treatment: no borderless, no showcase, no extended art, none. Only
+ * the basics ever do (full-art in DMU and MOM, showcase in ONE).
+ *
+ * Wizards' published contents say the same thing. The Brothers' War Jumpstart
+ * Booster is listed as two rares, eight non-land cards and "6 Non-foil lands, 2
+ * Traditional foil lands", with no Booster Fun in the list at all; Avatar's
+ * collecting article puts that set's borderless and neon-ink printings in
+ * Collector Boosters only.
+ *
+ * This matters for value, not just looks. A substituted pool contains every
+ * printing in the set, and borderless mythics are worth many times the plain
+ * card — which is how a $3.99 Avatar Jumpstart pack came to hold $12 of singles.
+ */
+const PLAIN_PRINTINGS_ONLY = new Set(['jumpstart']);
+
 function poolFor(cards, kind) {
 	const order = {
 		rare: ['rare', 'mythic', 'uncommon', 'common'],
@@ -374,6 +502,7 @@ export async function generateFallbackPack(setCode, packTypeId, released, rng = 
 	const relStr = released || pool.released;
 	const relMs = relStr ? Date.parse(relStr) : Date.now();
 	const allowTreatments = relMs >= Date.parse('2019-10-04'); // Throne of Eldraine
+	const plainOnly = PLAIN_PRINTINGS_ONLY.has(packTypeId);
 
 	// Prefer a real structure from a comparable set.
 	let slots = null;
@@ -397,9 +526,11 @@ export async function generateFallbackPack(setCode, packTypeId, released, rng = 
 		const TIER = { land: 0, common: 1, uncommon: 2, wildcard: 3, bonus: 5, rare: 6 };
 		slots = tpl.slots.map((s) => ({
 			kind: s.kind,
-			label: SLOT_LABELS[s.kind] || 'Card',
-			tier: TIER[s.kind] ?? 1,
-			foil: false,
+			label: (s.foil ? 'Foil ' : '') + (SLOT_LABELS[s.kind] || 'Card'),
+			tier: (TIER[s.kind] ?? 1) + (s.foil ? 0.5 : 0),
+			// Some templates make a slot foil outright — a Jumpstart deck's two
+			// traditional foil lands are always foil, not a foil chance.
+			foil: !!s.foil,
 			count: s.count,
 			mythicShare: s.kind === 'rare' ? tpl.mythicChance : 0
 		}));
@@ -418,6 +549,30 @@ export async function generateFallbackPack(setCode, packTypeId, released, rng = 
 	const used = new Set();
 
 	for (const slot of slots) {
+		// A land slot of more than one card is a preconstructed deck's mana base,
+		// and a real Jumpstart half-deck runs seven copies of ONE basic — every one
+		// of the DMU/BRO/ONE/MOM theme decks uses a single basic. Drawing seven
+		// distinct basics instead would be a deck nobody could play, so the basic
+		// is chosen once and repeated, and stays out of the pack-wide dedupe.
+		if (slot.kind === 'land' && slot.count > 1) {
+			const basics = poolFor(pool.cards, 'land');
+			if (!basics.length) continue;
+			const basic = pick(basics, rng);
+			for (let i = 0; i < slot.count; i++) {
+				cards.push(
+					makeInstance(basic, {
+						finish: slot.foil ? finishFor(true, basic) : 'nonfoil',
+						slot: 'land',
+						slotLabel: slot.label || SLOT_LABELS.land,
+						tier: slot.tier ?? 0,
+						sheet: null,
+						estimated: true
+					})
+				);
+			}
+			continue;
+		}
+
 		for (let i = 0; i < slot.count; i++) {
 			let kind = slot.kind;
 			if (kind === 'rare') kind = rng() < (slot.mythicShare || 0) ? 'mythic' : 'rare';
@@ -429,6 +584,13 @@ export async function generateFallbackPack(setCode, packTypeId, released, rng = 
 			}
 
 			let candidates = poolFor(pool.cards, kind);
+			// Basics are exempt: a full-art or showcase basic is the ordinary
+			// printing of a land in the sets that have one, and real Jumpstart
+			// decks use them.
+			if (plainOnly && kind !== 'land') {
+				const plain = candidates.filter((c) => !treatmentsOf(c).length);
+				if (plain.length) candidates = plain;
+			}
 			if (!allowTreatments) {
 				const plain = candidates.filter(
 					(c) => (c.borderColor || 'black') === 'black' && !(c.frameEffects || []).length
@@ -462,9 +624,12 @@ export async function generateFallbackPack(setCode, packTypeId, released, rng = 
 	// A set still mid-spoiler can have a dozen cards on Scryfall but only one
 	// common, which fills eight slots with the same card. Real packs never look
 	// like that, so refuse rather than render something obviously broken — the
-	// caller surfaces "card data unavailable".
-	const distinct = new Set(cards.map((c) => c.id)).size;
-	if (distinct < Math.ceil(cards.length * 0.75)) return null;
+	// caller surfaces "card data unavailable". Basic lands are excluded from the
+	// check: a Jumpstart deck's seven copies of one Island are the real product,
+	// and counting them as repeats rejected every Jumpstart pack built this way.
+	const spells = cards.filter((c) => c.slot !== 'land');
+	const distinct = new Set(spells.map((c) => c.id)).size;
+	if (distinct < Math.ceil(spells.length * 0.75)) return null;
 
 	return {
 		packTypeId,

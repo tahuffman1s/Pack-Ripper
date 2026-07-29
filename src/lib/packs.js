@@ -190,14 +190,26 @@ export function eraTemplate(releasedAt, packTypeId) {
 		};
 	}
 	if (packTypeId === 'jumpstart') {
+		// A Jumpstart pack is a preconstructed half-deck, not a rarity pyramid, so
+		// roughly a third of it is basic land. Measured over the seven Jumpstart
+		// products MTGJSON has sheets for (JMP, J22, J25 and the DMU/BRO/ONE/MOM
+		// companion boosters), the mean pack is 7.3 basics, 7.1 commons, 3.9
+		// uncommons and 1.71 rare-or-mythic — of which 0.18 mythic, an 11% mythic
+		// share rather than the 1-in-7 a booster's rare slot runs.
+		//
+		// The foils are LANDS, not a foil replacing a spell: Wizards lists The
+		// Brothers' War Jumpstart Booster as "6 Non-foil lands, 2 Traditional foil
+		// lands", and DMU, ONE and MOM are built the same way.
+		const foilLands = foilChance > 0 ? 2 : 0;
 		return {
 			size: 20,
-			mythicChance,
-			foilChance,
+			mythicChance: mythicChance > 0 ? 0.11 : 0,
+			foilChance: 0,
 			slots: [
-				{ kind: 'land', count: 3 },
-				{ kind: 'common', count: 12 },
-				{ kind: 'uncommon', count: 3 },
+				{ kind: 'land', count: 7 - foilLands },
+				...(foilLands ? [{ kind: 'land', count: foilLands, foil: true }] : []),
+				{ kind: 'common', count: 7 },
+				{ kind: 'uncommon', count: 4 },
 				{ kind: 'rare', count: 2 }
 			]
 		};

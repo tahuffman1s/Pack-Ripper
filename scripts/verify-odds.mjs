@@ -18,6 +18,7 @@
 import { getCollation } from '../src/lib/server/collation.js';
 import { generateFromVariant, makeRng, rarityAsFan, sheetMarginals } from '../src/lib/collate.js';
 import { variantForProduct } from '../src/lib/server/opener.js';
+import { structureOf } from '../src/lib/server/neighbour.js';
 
 const args = process.argv.slice(2);
 const nIdx = args.indexOf('--n');
@@ -78,6 +79,28 @@ const EXPECTED = [
 		product: 'draft',
 		label: 'Tempest — Draft Booster',
 		checks: [{ name: 'pack size always 15', get: (r) => r.sizes.size === 1 && r.sizes.has(15), want: true }]
+	},
+	{
+		// A Jumpstart pack is a preconstructed half-deck, so roughly a third of it
+		// is basic land. Nothing about that is published as odds, so the figure is
+		// MTGJSON's own theme-deck contents — the point of the check is that a pack
+		// which loses its mana base fails loudly instead of quietly.
+		code: 'jmp',
+		product: 'jumpstart',
+		label: 'Jumpstart — theme deck',
+		checks: [
+			{ name: 'pack size always 20', get: (r) => r.sizes.size === 1 && r.sizes.has(20), want: true },
+			{ name: 'basic lands per pack', get: (r) => r.landAsFan, want: 7.0, tol: 0.3, note: "MTGJSON's theme decks" }
+		]
+	},
+	{
+		code: 'dmu',
+		product: 'jumpstart',
+		label: 'Dominaria United — Jumpstart Booster',
+		checks: [
+			{ name: 'pack size always 20', get: (r) => r.sizes.size === 1 && r.sizes.has(20), want: true },
+			{ name: 'basic lands per pack', get: (r) => r.landAsFan, want: 7.2, tol: 0.3, note: "MTGJSON's theme decks" }
+		]
 	}
 ];
 
@@ -100,6 +123,7 @@ async function measure(code, product, n) {
 	let mythicSlot = 0;
 	let rareSlot = 0;
 	let serialized = 0;
+	let lands = 0;
 
 	for (let i = 0; i < n; i++) {
 		const { picked } = generateFromVariant(variant, { rng, facts: slice.cards });
@@ -109,6 +133,7 @@ async function measure(code, product, n) {
 		for (const p of picked) {
 			const f = slice.cards[p.uuid];
 			if (!f) continue;
+			if (/^Basic (Snow )?Land/i.test(f.t || '')) lands++;
 			if (f.r === 'rare' || f.r === 'mythic') hits++;
 			if (rareSheets.includes(p.sheet)) {
 				if (f.r === 'mythic') mythicSlot++;
@@ -126,6 +151,7 @@ async function measure(code, product, n) {
 		variantKey,
 		sizes,
 		asFan: rm / n,
+		landAsFan: lands / n,
 		multiRare: multi / n,
 		mythicShare: mythicSlot + rareSlot ? mythicSlot / (mythicSlot + rareSlot) : 0,
 		serialized: serialized / n,
@@ -157,6 +183,44 @@ for (const spec of targets) {
 		}
 		if (!pass) failures++;
 		console.log(`  ${pass ? 'PASS' : 'FAIL'}  ${c.name.padEnd(26)} ${shown}${c.note ? `   (${c.note})` : ''}`);
+	}
+}
+
+/**
+ * The borrowed-structure path, which the sampling above cannot reach.
+ *
+ * A set too new for MTGJSON's last build collates from the nearest comparable
+ * set's real structure with only the card pool substituted (see neighbour.js).
+ * A Jumpstart theme deck is a `fixed` sheet, and classified as a whole it reads
+ * "wildcard" — so a structure that does not expand it borrows one twenty-card
+ * wildcard slot, and every substituted Jumpstart pack comes out as twenty spells
+ * with no mana base. Assert the lands survive the round trip.
+ */
+if (!only.length || only.includes('jmp') || only.includes('dmu')) {
+	console.log('\nBorrowed Jumpstart structure  [structureOf]');
+	for (const code of ['jmp', 'dmu']) {
+		const slice = await getCollation(code);
+		const variantKey = slice && variantForProduct(slice, 'jumpstart');
+		if (!variantKey) {
+			console.log(`  SKIP — no jumpstart collation for ${code}`);
+			continue;
+		}
+		const structure = structureOf(slice, variantKey);
+		let worstLand = Infinity;
+		let worstSize = null;
+		for (const cfg of structure.configs) {
+			const land = cfg.slots.filter((s) => s.kind === 'land').reduce((a, s) => a + s.count, 0);
+			const size = cfg.slots.reduce((a, s) => a + s.count, 0);
+			if (land < worstLand) worstLand = land;
+			if (size !== 20) worstSize = size;
+		}
+		const pass = worstLand >= 4 && worstSize === null;
+		if (!pass) failures++;
+		console.log(
+			`  ${pass ? 'PASS' : 'FAIL'}  ${code.toUpperCase().padEnd(26)} every config is 20 cards${
+				worstSize === null ? '' : ` (saw ${worstSize})`
+			}, fewest lands ${worstLand}`
+		);
 	}
 }
 

@@ -201,7 +201,33 @@ export function productsForSet(set) {
 }
 
 // ── Buying ─────────────────────────────────────────────────────
-export function buy(userId, { setCode, packTypeId, kind }) {
+
+/**
+ * Ceiling on one purchase, counted in PACKS rather than in units, so "10 boxes"
+ * and "360 packs" are held to the same limit. Each pack is its own inventory row
+ * and the whole vault is written out on every mutation, so this is what keeps a
+ * fat-fingered order from turning .data/db.json into something unwieldy.
+ */
+export const MAX_BUY_PACKS = 1080; // five 216-pack cases
+
+/** How many packs one unit of this product is worth. */
+function unitPacks(set, packTypeId, kind) {
+	return kind === 'box' ? boxSizeFor(set, packTypeId) : 1;
+}
+
+/** Largest quantity of this product a purchase may be, for the UI's "Max". */
+export function maxBuyQty(set, packTypeId, kind, gold) {
+	const unit = kind === 'box' ? boxPriceGold(set, packTypeId) : packPriceGold(set, packTypeId);
+	if (!(unit > 0)) return 0;
+	const byCap = Math.floor(MAX_BUY_PACKS / unitPacks(set, packTypeId, kind));
+	return Math.max(0, Math.min(byCap, Math.floor((gold || 0) / unit)));
+}
+
+/**
+ * Buy `qty` of a product. Everything lands in ONE write — buying a case of
+ * Play Boosters is a single flush of .data/db.json, not 216 of them.
+ */
+export function buy(userId, { setCode, packTypeId, kind, qty = 1 }) {
 	setCode = String(setCode || '').toLowerCase();
 	const set = setEntry(setCode);
 	if (!set) return { ok: false, error: 'Unknown set.' };
@@ -210,24 +236,33 @@ export function buy(userId, { setCode, packTypeId, kind }) {
 	const type = packTypeById(packTypeId);
 	if (!type) return { ok: false, error: 'Unknown pack type.' };
 
-	const qty = kind === 'box' ? boxSizeFor(set, packTypeId) : 1;
-	const price = kind === 'box' ? boxPriceGold(set, packTypeId) : packPriceGold(set, packTypeId);
+	const per = unitPacks(set, packTypeId, kind);
+	const units = Math.floor(Number(qty) || 0);
+	if (units < 1) return { ok: false, error: 'Choose how many to buy.' };
+	if (units * per > MAX_BUY_PACKS) {
+		return { ok: false, error: `That is over the ${MAX_BUY_PACKS.toLocaleString()}-pack limit for one order.` };
+	}
+
+	const unitPrice = kind === 'box' ? boxPriceGold(set, packTypeId) : packPriceGold(set, packTypeId);
+	const price = unitPrice * units;
 
 	const wallet = getWallet(userId);
 	if (wallet.gold < price) return { ok: false, error: 'Not enough gold.' };
 
+	const added = units * per;
 	mutate((d) => {
 		d.wallets[userId].gold -= price;
 		const now = Date.now();
-		for (let i = 0; i < qty; i++) {
-			d.inventory[userId].push({ id: makeId(), setCode, packTypeId, acquiredAt: now });
+		const inv = (d.inventory[userId] ??= []);
+		for (let i = 0; i < added; i++) {
+			inv.push({ id: makeId(), setCode, packTypeId, acquiredAt: now });
 		}
 		const s = (d.stats[userId] ??= newStats());
 		s.goldSpent += price;
-		if (kind === 'box') s.boxesOpened += 1;
+		if (kind === 'box') s.boxesOpened += units;
 	});
 
-	return { ok: true, added: qty, price, gold: getWallet(userId).gold };
+	return { ok: true, added, units, price, gold: getWallet(userId).gold };
 }
 
 // ── Opening ────────────────────────────────────────────────────

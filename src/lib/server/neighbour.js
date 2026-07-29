@@ -13,7 +13,7 @@
  */
 
 import { getAllSets } from './scryfall.js';
-import { getCollation } from './collation.js';
+import { getCollation, cardSlotKind, slotTier, labelFor } from './collation.js';
 import { VARIANT_PREFERENCE, isExcludedVariant } from '../packs.js';
 
 const MAX_CANDIDATES = 8; // bound the network cost of the search
@@ -73,6 +73,40 @@ export async function nearestCollation(setCode, packTypeId, released, setType) {
 }
 
 /**
+ * Expand a `fixed` sheet — a preconstructed deck, taken in full — into one slot
+ * per kind, counted by print weight.
+ *
+ * A Jumpstart theme deck is a fixed sheet of twenty specific cards, seven of
+ * them basic lands. Classified as a whole that sheet reads "wildcard", so
+ * borrowing it as a single twenty-card wildcard slot is exactly how a
+ * substituted Jumpstart pack ends up with twenty spells and no land at all.
+ * Expanded, the borrowed structure keeps the donor deck's real
+ * land/common/uncommon/rare mix.
+ */
+function fixedSlots(sheet, facts) {
+	const counts = new Map();
+	let mythic = 0;
+	let rareish = 0;
+	for (const [uuid, w] of Object.entries(sheet.cards)) {
+		const fact = facts[uuid];
+		const kind = cardSlotKind(fact);
+		counts.set(kind, (counts.get(kind) || 0) + w);
+		if (kind === 'rare') {
+			rareish += w;
+			if (fact?.r === 'mythic') mythic += w;
+		}
+	}
+	return [...counts].map(([kind, count]) => ({
+		kind,
+		label: labelFor(kind, sheet.foil),
+		tier: slotTier(kind, sheet.foil),
+		foil: !!sheet.foil,
+		count,
+		mythicShare: kind === 'rare' && rareish > 0 ? mythic / rareish : 0
+	}));
+}
+
+/**
  * Reduce a real variant to a reusable shape: a weighted list of configurations,
  * each a list of {kind, count, foil} slots. Card identities are dropped; only
  * the structure survives.
@@ -84,18 +118,21 @@ export function structureOf(slice, variantKey) {
 		total: v.boostersTotalWeight,
 		configs: v.boosters.map((cfg) => ({
 			weight: cfg.weight,
-			slots: Object.entries(cfg.contents).map(([sheetName, count]) => {
+			slots: Object.entries(cfg.contents).flatMap(([sheetName, count]) => {
 				const sheet = v.sheets[sheetName];
-				return {
-					kind: sheet?.kind || 'wildcard',
-					label: sheet?.label || 'Card',
-					tier: sheet?.tier ?? 1,
-					foil: !!sheet?.foil,
-					count,
-					// The real mythic share of this sheet, so a substituted pool
-					// keeps the donor set's actual rare:mythic ratio.
-					mythicShare: mythicShareOf(sheet, slice.cards)
-				};
+				if (sheet?.fixed) return fixedSlots(sheet, slice.cards);
+				return [
+					{
+						kind: sheet?.kind || 'wildcard',
+						label: sheet?.label || 'Card',
+						tier: sheet?.tier ?? 1,
+						foil: !!sheet?.foil,
+						count,
+						// The real mythic share of this sheet, so a substituted pool
+						// keeps the donor set's actual rare:mythic ratio.
+						mythicShare: mythicShareOf(sheet, slice.cards)
+					}
+				];
 			})
 		}))
 	};

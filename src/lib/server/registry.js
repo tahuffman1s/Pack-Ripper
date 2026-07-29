@@ -1,6 +1,13 @@
 import { getAllSets } from './scryfall.js';
-import { boosterTypesForSet, jumpstartParentCodes, storeEligible, tagFor, isFeatured } from '../catalog.js';
-import { initSealed, warmSealed } from './tcgplayer.js';
+import {
+	boosterTypesForSet,
+	jumpstartParentCodes,
+	marketCandidate,
+	storeEligible,
+	tagFor,
+	isFeatured
+} from '../catalog.js';
+import { initSealed, warmSealed, getSealed } from './tcgplayer.js';
 
 /**
  * In-memory registry of every Magic set, annotated with the booster products it
@@ -14,7 +21,7 @@ let storeList = null; // eligible sets, newest first
 let loading = null;
 
 function annotate(s, jumpstartParents) {
-	const boosterTypes = boosterTypesForSet(s, jumpstartParents);
+	const boosterTypes = boosterTypesForSet(s, jumpstartParents, getSealed(s.code));
 	const releaseMs = s.released ? Date.parse(s.released) : 0;
 	return {
 		...s,
@@ -32,19 +39,31 @@ export async function ensureSets() {
 	if (!loading) {
 		loading = (async () => {
 			const sets = await getAllSets();
-				// Needs the whole list: a set's Jumpstart Booster is evidenced by a
-				// *companion* set, not by anything on the set itself.
-				const jumpstartParents = jumpstartParentCodes(sets);
-				const idx = new Map();
-				for (const s of sets) idx.set(s.code, annotate(s, jumpstartParents));
-				index = idx;
+			initSealed();
+
+			// Sets Scryfall does not type as booster sets, but which may still have
+			// sold boosters — the standalone Universes Beyond Commander releases and
+			// the Portal-era starter sets. Whether they belong in the store at all
+			// depends on what TCGplayer lists for them, so those ~55 entries are
+			// resolved up front rather than left to the background warm below.
+			// Measured at 0.55s cold and nothing at all once the disk cache is warm.
+			try {
+				await warmSealed(sets.filter(marketCandidate));
+			} catch (e) {
+				console.error('sealed lookup for non-booster set types failed:', e);
+			}
+
+			// Needs the whole list: a set's Jumpstart Booster is evidenced by a
+			// *companion* set, not by anything on the set itself.
+			const jumpstartParents = jumpstartParentCodes(sets);
+			const idx = new Map();
+			for (const s of sets) idx.set(s.code, annotate(s, jumpstartParents));
+			index = idx;
 			storeList = [...idx.values()]
 				.filter(storeEligible)
 				.sort((a, b) => String(b.released || '').localeCompare(String(a.released || '')));
 
-			// Load cached TCGplayer sealed prices and warm any missing ones in
-			// the background (doesn't block requests).
-			initSealed();
+			// Warm the rest of the sealed prices in the background (doesn't block).
 			warmSealed(storeList).catch((e) => console.error('warmSealed failed:', e));
 		})();
 	}

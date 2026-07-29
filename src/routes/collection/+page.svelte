@@ -1,5 +1,6 @@
 <script>
 	import { invalidateAll } from '$app/navigation';
+	import { SvelteSet } from 'svelte/reactivity';
 	import CardTile from '$lib/components/CardTile.svelte';
 	import { rarityInfo, cardImage, marketGold, sellGold } from '$lib/cards.js';
 	import { formatGold } from '$lib/economy.js';
@@ -15,12 +16,41 @@
 	let selling = $state(false);
 	let toastTimer;
 
-	// selection tracked as a plain array of card uids
-	let selectedUids = $state([]);
-	function toggle(uid) {
-		if (selectedUids.includes(uid)) selectedUids = selectedUids.filter((x) => x !== uid);
-		else selectedUids = [...selectedUids, uid];
+	/**
+	 * Selection is a Set, not an array.
+	 *
+	 * Every tile asks whether it is selected, so an array made the whole grid
+	 * O(n²): selecting one card in a 10,000-card collection ran 10,000 `includes`
+	 * scans over a 10,000-element array. A Set answers each in constant time.
+	 */
+	let selected = new SvelteSet();
+
+	/**
+	 * Running total of what the selection sells for, kept up to date as it changes
+	 * rather than recomputed. Deriving it re-scanned the entire collection on every
+	 * tap — and "select all" made that scan quadratic on its own.
+	 */
+	let selectedValue = $state(0);
+
+	function toggle(card) {
+		if (selected.has(card.uid)) {
+			selected.delete(card.uid);
+			selectedValue -= sellGold(card);
+		} else {
+			selected.add(card.uid);
+			selectedValue += sellGold(card);
+		}
 	}
+
+	/**
+	 * How many tiles the grid renders. Ten thousand card tiles is ten thousand
+	 * images, badges and gradients — enough DOM to stall the page for seconds
+	 * before you can touch anything, whether or not you ever scroll that far. The
+	 * list is windowed instead and grows as the sentinel below it comes into view;
+	 * filtering, sorting and selecting still see every card.
+	 */
+	const PAGE = 120;
+	let shown = $state(PAGE);
 
 	const filtered = $derived.by(() => {
 		let list = data.cards;
@@ -36,9 +66,29 @@
 		return arr;
 	});
 
-	const selectedValue = $derived(
-		data.cards.filter((c) => selectedUids.includes(c.uid)).reduce((a, c) => a + sellGold(c), 0)
-	);
+	// A new filter or sort order starts the window over at the top.
+	const listKey = $derived(`${filter}|${setFilter}|${sort}`);
+	let lastKey = 'all||value';
+	$effect(() => {
+		if (listKey !== lastKey) {
+			lastKey = listKey;
+			shown = PAGE;
+		}
+	});
+
+	const visible = $derived(filtered.length > shown ? filtered.slice(0, shown) : filtered);
+
+	/** Grow the window when the sentinel after the last rendered tile is reached. */
+	function moreOnView(node) {
+		const io = new IntersectionObserver(
+			(entries) => {
+				if (entries.some((e) => e.isIntersecting)) shown += PAGE;
+			},
+			{ rootMargin: '600px' }
+		);
+		io.observe(node);
+		return { destroy: () => io.disconnect() };
+	}
 
 	function showToast(msg, ok = true) {
 		toast = { msg, ok };
@@ -47,18 +97,25 @@
 	}
 
 	function cardClick(card) {
-		if (selectMode) toggle(card.uid);
+		if (selectMode) toggle(card);
 		else detail = card;
 	}
 
+	/** Select every card the current filters admit — not just the rendered window. */
 	function selectAllFiltered() {
-		selectedUids = [...new Set([...selectedUids, ...filtered.map((c) => c.uid)])];
+		let added = 0;
+		for (const c of filtered) {
+			if (selected.has(c.uid)) continue;
+			selected.add(c.uid);
+			added += sellGold(c);
+		}
+		selectedValue += added;
 	}
 	function clearSel() {
-		selectedUids = [];
+		selected.clear();
+		selectedValue = 0;
 	}
 
-	// (removed unused shim)
 	async function sell(uids) {
 		if (!uids.length || selling) return;
 		selling = true;
@@ -71,7 +128,7 @@
 			if (!res.ok) throw new Error('Sale failed');
 			const r = await res.json();
 			showToast(`Sold ${r.sold} card${r.sold === 1 ? '' : 's'} for 🪙 ${formatGold(r.earned)}`);
-			selectedUids = [];
+			clearSel();
 			detail = null;
 			await invalidateAll();
 		} catch (e) {
@@ -87,7 +144,9 @@
 <div class="flex items-end justify-between mb-3">
 	<div>
 		<h1 class="text-2xl font-black">Collection</h1>
-		<p class="text-base-content/60 text-sm">{data.cards.length} cards · worth 🪙 {formatGold(data.value)}</p>
+		<p class="text-base-content/60 text-sm">
+			{data.cards.length.toLocaleString()} cards · worth 🪙 {formatGold(data.value)}
+		</p>
 	</div>
 	{#if data.cards.length}
 		<button class="btn btn-sm {selectMode ? 'btn-primary' : 'btn-ghost'}" onclick={() => { selectMode = !selectMode; if (!selectMode) clearSel(); }}>
@@ -126,32 +185,51 @@
 		</select>
 	</div>
 
+	{#if filtered.length !== data.cards.length}
+		<p class="text-xs text-base-content/50 mb-2">{filtered.length.toLocaleString()} matching</p>
+	{/if}
+
 	<div class="grid grid-cols-3 sm:grid-cols-4 gap-2 pb-2">
-		{#each filtered as card (card.uid)}
+		{#each visible as card (card.uid)}
 			<CardTile
 				{card}
 				selectable={selectMode}
-				selected={selectedUids.includes(card.uid)}
+				selected={selected.has(card.uid)}
 				onclick={() => cardClick(card)}
 			/>
 		{/each}
 	</div>
+
+	{#if filtered.length > visible.length}
+		<div use:moreOnView class="py-6 grid place-items-center text-xs text-base-content/40">
+			<span class="loading loading-dots loading-sm"></span>
+			<span class="mt-1">{(filtered.length - visible.length).toLocaleString()} more</span>
+		</div>
+	{/if}
+
+	<!-- room for the selection bar, which floats over the bottom of the grid -->
+	{#if selectMode}<div class="h-24"></div>{/if}
 {/if}
 
 <!-- selection action bar -->
-{#if selectMode && selectedUids.length}
+{#if selectMode}
 	<div class="fixed inset-x-0 bottom-0 z-40 p-3 pb-safe">
 		<div class="mx-auto max-w-2xl card bg-base-100 border border-primary/40 shadow-2xl">
-			<div class="card-body p-3 flex-row items-center gap-3">
+			<div class="card-body p-3 flex-row items-center gap-2">
 				<div class="flex-1 min-w-0">
-					<div class="font-bold">{selectedUids.length} selected</div>
+					<div class="font-bold">{selected.size.toLocaleString()} selected</div>
 					<div class="text-sm text-accent">Sell for 🪙 {formatGold(selectedValue)}</div>
 				</div>
-				<button class="btn btn-ghost btn-sm" onclick={selectAllFiltered}>All</button>
-				<button class="btn btn-primary btn-sm" onclick={() => sell(selectedUids)} disabled={selling}>
-					{#if selling}<span class="loading loading-spinner loading-xs"></span>{/if}
-					Sell
+				<button class="btn btn-ghost btn-sm" onclick={selectAllFiltered}>
+					All {filtered.length !== data.cards.length ? `(${filtered.length.toLocaleString()})` : ''}
 				</button>
+				{#if selected.size}
+					<button class="btn btn-ghost btn-sm" onclick={clearSel}>None</button>
+					<button class="btn btn-primary btn-sm" onclick={() => sell([...selected])} disabled={selling}>
+						{#if selling}<span class="loading loading-spinner loading-xs"></span>{/if}
+						Sell
+					</button>
+				{/if}
 			</div>
 		</div>
 	</div>

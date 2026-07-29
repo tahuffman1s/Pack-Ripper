@@ -6,7 +6,7 @@
  * set offers, following real Magic history, and add a bit of curated flavour.
  */
 
-import { isSealedProduct, isMysterySet } from './packs.js';
+import { isSealedProduct, isMysterySet, PACK_TYPE_ORDER } from './packs.js';
 
 // Historical product-era boundaries (release dates).
 const COLLECTOR_START = Date.parse('2019-10-01'); // Throne of Eldraine — first Collector Boosters
@@ -48,15 +48,62 @@ export function jumpstartParentCodes(sets) {
 }
 
 /**
+ * Set types where Scryfall's typing can hide a real booster product, so the
+ * market is worth checking. Deliberately narrow: probing every duel deck, Secret
+ * Lair and Game Night box would cost far more than it could ever find.
+ *
+ * `commander` covers the standalone Universes Beyond releases, `starter` the
+ * Portal sets.
+ */
+const MARKET_CANDIDATE_TYPES = new Set(['commander', 'starter']);
+
+/**
+ * Whether this set's product line-up should be settled by what the market lists
+ * rather than by its Scryfall type. See `marketBoosterTypes`.
+ */
+export function marketCandidate(set) {
+	if (!set || set.digital) return false;
+	if (BOOSTER_SET_TYPES.has(set.type)) return false;
+	if (!MARKET_CANDIDATE_TYPES.has(set.type)) return false;
+	if ((set.cardCount || 0) < 60) return false;
+	return isSealedProduct(set.code);
+}
+
+/**
+ * Products a set sold, according to TCGplayer's own catalogue of sealed product.
+ *
+ * Scryfall's set_type describes what a release *was*, not what it shipped in, and
+ * for Universes Beyond that difference hides whole products: Fallout and Doctor
+ * Who are typed `commander` because they came as Commander decks, yet both also
+ * sold Collector Boosters — and MTGJSON has the real collation for them. The
+ * Portal sets are typed `starter` and sold ordinary booster packs.
+ *
+ * No type or date rule can separate those from the sets that genuinely sold no
+ * boosters, because the near misses look identical: every numbered Commander
+ * release, Starter Commander Decks, and Warhammer 40,000 — whose surge-foil
+ * cards came in Collector's Edition DECKS, not boosters. A listed sealed booster
+ * is the evidence that settles all of them, and it agrees with MTGJSON's
+ * collation on every set where both have an opinion.
+ * @param {Record<string, object>} [marketTypes] from tcgplayer.js `getSealed`
+ */
+function marketBoosterTypes(marketTypes) {
+	if (!marketTypes) return [];
+	return PACK_TYPE_ORDER.filter((t) => marketTypes[t]);
+}
+
+/**
  * Which booster products this set offers, in proper display order
  * (the "opening" product first, then premium).
  * @param {object} set
  * @param {Set<string>} [jumpstartParents] from `jumpstartParentCodes`
+ * @param {Record<string, object>} [marketTypes] from tcgplayer.js `getSealed`
  * @returns {string[]}
  */
-export function boosterTypesForSet(set, jumpstartParents) {
+export function boosterTypesForSet(set, jumpstartParents, marketTypes) {
 	if (!set || set.digital) return [];
-	if (!BOOSTER_SET_TYPES.has(set.type)) return [];
+	if (!BOOSTER_SET_TYPES.has(set.type)) {
+		return marketCandidate(set) ? marketBoosterTypes(marketTypes) : [];
+	}
 
 	const rel = releasedMs(set);
 	const types = [];
@@ -92,15 +139,19 @@ export function boosterTypesForSet(set, jumpstartParents) {
 	return types;
 }
 
-/** Whether a set belongs in the store (has products and a real card pool). */
+/**
+ * Whether a set belongs in the store (has products and a real card pool).
+ *
+ * Takes the annotated `boosterTypes` when the registry has already worked them
+ * out, since that pass is the one with the market evidence in hand.
+ */
 export function storeEligible(set) {
 	if (!set || set.digital) return false;
-	if (!BOOSTER_SET_TYPES.has(set.type)) return false;
 	if ((set.cardCount || 0) < 60) return false; // skip tiny promo-ish sets
 	// Bonus sheets and foreign reprints look like booster sets to Scryfall but
 	// were never sold as sealed product — there is no "Draft Booster of The List".
 	if (!isSealedProduct(set.code)) return false;
-	return boosterTypesForSet(set).length > 0;
+	return (set.boosterTypes || boosterTypesForSet(set)).length > 0;
 }
 
 // A few marquee sets we surface on the home page.
@@ -126,7 +177,9 @@ const TYPE_LABEL = {
 	expansion: 'Expansion',
 	masters: 'Masters',
 	draft_innovation: 'Special',
-	funny: 'Un-set'
+	funny: 'Un-set',
+	commander: 'Commander',
+	starter: 'Starter'
 };
 
 export function tagFor(set) {

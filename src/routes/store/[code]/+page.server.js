@@ -1,6 +1,6 @@
 import { error, fail } from '@sveltejs/kit';
 import { setEntry } from '$lib/server/registry.js';
-import { productsForSet, buy } from '$lib/server/game.js';
+import { productsForSet, buy, MAX_BUY_PACKS } from '$lib/server/game.js';
 import { fetchSetSealed } from '$lib/server/tcgplayer.js';
 import { getCollation } from '$lib/server/collation.js';
 import { packEvUsd } from '$lib/server/packvalue.js';
@@ -31,7 +31,8 @@ export async function load({ params }) {
 			unreleased: set.unreleased
 		},
 		icon: set.icon || null,
-		products: productsForSet(set)
+		products: productsForSet(set),
+		maxBuyPacks: MAX_BUY_PACKS
 	};
 }
 
@@ -43,12 +44,14 @@ export const actions = {
 		const setCode = String(form.get('setCode') || '');
 		const packTypeId = String(form.get('packTypeId') || '');
 		const kind = String(form.get('kind') || 'pack');
+		const qty = Number(form.get('qty') || 1);
 
-		const result = buy(locals.user.id, { setCode, packTypeId, kind });
+		const result = buy(locals.user.id, { setCode, packTypeId, kind, qty });
 		if (!result.ok) return fail(400, { error: result.error });
 		return {
 			success: true,
 			added: result.added,
+			units: result.units,
 			price: result.price,
 			gold: result.gold,
 			kind,
