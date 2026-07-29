@@ -18,11 +18,17 @@
 
   Two sources for that file, whichever is fresher:
 
-    - status.json next to this page. Same origin, so a ?t= cache-buster is
-      honoured, but it only changes once GitHub Pages redeploys the branch —
-      usually under a minute behind the commit.
-    - the same file read straight off the pages branch through
-      raw.githubusercontent.com, which is current the instant run.sh writes it.
+    - status.json next to this page. A commit to the branch triggers a Pages
+      deploy and the deploy purges the CDN, so this is the fast path: measured at
+      15s from commit to serving the new file.
+    - the same file read off the pages branch through raw.githubusercontent.com.
+      This is the backstop, for a Pages deploy that is queued or has failed. It
+      is NOT faster — raw sends max-age=300 and is not purged on push, so it can
+      sit up to five minutes behind.
+
+  Neither is reliably ahead, and no query string can hurry either along (GitHub's
+  CDN keys on the path alone — a unique ?t= still comes back x-cache: HIT). Hence
+  reading both and going by the timestamp inside the file.
 
   And the URL is never trusted on its own: /api/health has to answer before we
   navigate. That is what makes a dead tunnel show as offline instead of dumping
@@ -196,6 +202,9 @@
 	const PATH = requestedPath();
 
 	// ── status ────────────────────────────────────────────────────
+	// Defeats this browser's own cache. It does nothing to GitHub's CDN, which
+	// keys on the path alone — a unique ?t= still answers x-cache: HIT — so the
+	// staleness the two-source merge below deals with is not fixable from here.
 	const bust = (u) => u + (u.includes('?') ? '&' : '?') + 't=' + Date.now();
 
 	async function readOne(url) {
@@ -213,9 +222,10 @@
 		const raw = `https://raw.githubusercontent.com/${CONFIG.repo}/${CONFIG.branch}/status.json`;
 		const found = (await Promise.all([readOne(BASE + 'status.json'), readOne(raw)])).filter(Boolean);
 		if (!found.length) return null;
-		// The Pages copy trails the branch by a deploy, and the raw CDN can hold
-		// an old copy for a few minutes. Neither is reliably ahead, so go by the
-		// timestamp inside the file rather than by which source it came from.
+		// The Pages copy is usually the fresher of the two (a deploy purges its
+		// CDN; measured 15s from commit), but raw wins whenever a deploy is queued
+		// or failed. Neither is reliably ahead, so go by the timestamp inside the
+		// file rather than by which source it came from.
 		return found.sort((a, b) => b.at - a.at)[0];
 	}
 

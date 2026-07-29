@@ -267,7 +267,7 @@ run.sh                       pages branch                github.io page
   else would notice. It writes only on change, so an idle watcher makes no commits.
 - **The page never trusts the file on its own.** It fetches `status.json` from two places and
   takes the fresher one — the copy served by Pages, and the copy read straight off the branch
-  through `raw.githubusercontent.com`, which is current the instant `run.sh` writes it — then
+  through `raw.githubusercontent.com` as a backstop — then
   requires `/api/health` to answer before it navigates. That endpoint sends
   `access-control-allow-origin: *` purely so this check can tell "PackRipper is there" apart
   from "the hostname is gone"; without the header a cross-origin fetch reports both as the
@@ -278,9 +278,10 @@ run.sh                       pages branch                github.io page
 
 ### Turning it on
 
-1. Push to `main`. The `pages` workflow creates the `pages` branch from `pages/` and tries to
-   switch Pages on for you. If it could not, set it once by hand: **Settings → Pages → Deploy
-   from a branch → `pages` / `(root)`**.
+1. Push to `main`. The `pages` workflow creates the `pages` branch from `pages/`, then **turn
+   Pages on by hand, once**: **Settings → Pages → Deploy from a branch → `pages` / `(root)`**.
+   The workflow does try, but creating a Pages site needs admin rights the automatic
+   `GITHUB_TOKEN` does not have, and it did not work here.
 2. Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new)
    scoped to **this repository only**, with **Contents: Read and write** and nothing else.
    Put it in `.env` as `GITHUB_TOKEN`.
@@ -294,9 +295,13 @@ did not publish, and behaves exactly as it did before.
 
 Worth knowing:
 
-- The Pages copy of `status.json` trails the branch by one Pages deploy, usually well under a
-  minute. The `raw.githubusercontent.com` read is immediate, which is why both are consulted;
-  each is fetched with a cache-buster and the newer timestamp wins.
+- **Propagation, measured** on this repo rather than assumed. A commit to the `pages` branch
+  was being served by Pages **15 seconds** later — a deploy purges its CDN. The same file
+  through `raw.githubusercontent.com` took **4m18s**: it sends `max-age=300` and is *not*
+  purged on push. So Pages is the fast path and raw is the backstop for a deploy that is
+  queued or has failed, which is why both are read and the newer timestamp wins. No
+  cache-buster can hurry either — GitHub's CDN keys on the path, and a unique `?t=` still
+  answers `x-cache: HIT`.
 - The redirect only helps people who arrive *via* the github.io link. Someone already inside
   the app when the tunnel dies is on the old `trycloudflare.com` host and will just see it
   fail — they have to go back to the permanent link.
