@@ -8,10 +8,13 @@
  * process editing that file would have its work silently overwritten by the next
  * thing any player did. Going through the app is the only way a change sticks.
  *
- * Run it from the repo on the host, or from inside the container:
+ * Run it from the repo on the host, or from inside the container, where the image
+ * puts it on the PATH as `admin` — that one is typed by hand in the Azure console,
+ * so it is worth being short:
  *
  *   ./admin.sh gold travis 50000
- *   podman exec packripper node /app/admin.mjs gold travis 50000
+ *   podman exec packripper admin gold travis 50000
+ *   admin gold travis 50000                          (from a console inside it)
  *
  * Configuration, all overridable per-invocation:
  *
@@ -29,10 +32,21 @@
 import { randomBytes } from 'node:crypto';
 import { userInfo } from 'node:os';
 
-const HELP = `
-PackRipper admin — commands run against a running container.
+/**
+ * How to spell this command back at whoever ran it. Inside the container the repo
+ * wrapper does not exist — telling someone in the Azure console to run
+ * `./admin.sh` sends them looking for a file that is not there.
+ *
+ * The image copies this script to a fixed path, which is what makes the test
+ * reliable: /app/admin.mjs is only ever the containerised copy.
+ */
+const SELF = process.argv[1] || '';
+const ME = SELF === '/app/admin.mjs' || SELF.endsWith('/usr/local/bin/admin') ? 'admin' : './admin.sh';
 
-  usage: ./admin.sh <command> [args] [--url URL] [--token TOKEN] [--as NAME] [--json]
+const HELP = `
+PackRipper admin — commands run against a running app.
+
+  usage: ${ME} <command> [args] [--url URL] [--token TOKEN] [--as NAME] [--json]
 
 Accounts
   list                              every account, richest first
@@ -146,7 +160,7 @@ async function api(action, body = {}) {
 	if (!TOKEN) {
 		die(
 			'no ADMIN_TOKEN.',
-			'Set ADMIN_TOKEN on the container and in .env (./admin.sh token generates one).'
+			`Set ADMIN_TOKEN on the container and in .env (${ME} token generates one).`
 		);
 	}
 
@@ -375,7 +389,7 @@ const COMMANDS = {
 };
 
 const run = COMMANDS[command] || COMMANDS[command.replace(/^--?/, '')];
-if (!run) die(`unknown command "${command}".`, 'try ./admin.sh help');
+if (!run) die(`unknown command "${command}".`, `try ${ME} help`);
 
 try {
 	await run();

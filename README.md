@@ -255,11 +255,26 @@ It talks to a **running** app over HTTP — `http://127.0.0.1:$PORT` by default,
 `PACKRIPPER_URL` for anything else, so the Azure copy is administered from here with
 `--url https://<hostname>`. `--json` prints raw JSON for piping into `jq`.
 
-The image also carries the script at `/app/admin.mjs`, for a host with no checkout:
+### Inside the container
+
+The image puts the same CLI on the `PATH` as **`admin`**, which is the form to use in the Azure
+Container App's console, where every character is typed by hand:
 
 ```bash
-podman exec packripper node /app/admin.mjs list      # or ./admin.sh list --in-container
+admin list
+admin gold travis 50000
 ```
+
+Or from a host that has the container but no checkout:
+
+```bash
+podman exec packripper admin list      # or ./admin.sh list --in-container
+```
+
+`admin.sh` itself is deliberately **not** in the image, and could not be: it is a bash script and
+the runtime image is Alpine with no bash. It also has nothing to do there — finding `.env` and
+choosing between local `node` and `exec` are questions that only exist outside the container. The
+one thing it adds inside, a short name, the image provides directly.
 
 `--in-container` is what `./admin.sh` falls back to when this machine has no `node` at all. It
 looks for a container called `packripper`; set `PACKRIPPER_CONTAINER` if yours is named something

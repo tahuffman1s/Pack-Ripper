@@ -33,11 +33,17 @@ RUN apk add --no-cache curl
 
 COPY --from=build /app/build ./build
 
-# The admin CLI, so `podman exec packripper node /app/admin.mjs ...` works on a
-# host that has no copy of the repo — the Azure console, for instance. It is a
-# dependency-free script that talks to the app over loopback; it carries no
+# The admin CLI, for a host with no copy of the repo — the Azure console, above
+# all. A dependency-free script that talks to the app over loopback; it carries no
 # privileges of its own and does nothing without ADMIN_TOKEN set.
+#
+# `admin` on the PATH because this is typed by hand in a web console, where
+# `node /app/admin.mjs gold someone 5000` is a lot to get right. The repo's
+# ./admin.sh is NOT here and cannot be: it is bash, and this image has none — and
+# everything it does (find .env, choose between local node and `exec`) is a
+# question that only exists outside the container.
 COPY scripts/admin.mjs ./admin.mjs
+RUN ln -s /app/admin.mjs /usr/local/bin/admin
 
 # Bind-mounted by run.sh / compose; in Azure only .data is mounted, from a file
 # share. Declared anyway so an unmounted container still boots (it just starts

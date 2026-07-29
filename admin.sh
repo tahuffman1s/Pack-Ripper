@@ -30,6 +30,9 @@
 #   --in-container   run inside the container via podman/docker exec, instead of
 #                    on this machine. Automatic when node is not installed here.
 #                    Set PACKRIPPER_CONTAINER if it is not named `packripper`.
+#                    In the container the same CLI is on the PATH as `admin` — use
+#                    that directly from the Azure console. This script is not
+#                    there (it is bash; the image is Alpine) and is not needed.
 #   --url URL        a remote app — the Azure hostname, say. Passed through.
 
 set -euo pipefail
@@ -80,6 +83,8 @@ if [ -n "$IN_CONTAINER" ]; then
 	# the app is on loopback, which is the CLI's default.
 	$ENGINE container inspect "$APP" >/dev/null 2>&1 ||
 		die "no container named $APP — start it with ./run.sh, or drop --in-container"
+	# The explicit path, not the `admin` symlink: this wrapper gains nothing from the
+	# short name, and the path works against an older image that predates the link.
 	exec $ENGINE exec -e "TERM=${TERM:-dumb}" "$APP" node /app/admin.mjs "$@"
 fi
 
