@@ -1,0 +1,110 @@
+@import 'tailwindcss';
+
+@plugin "daisyui" {
+	themes: false;
+}
+
+/* Custom dark "ripper" theme — arcane / foil vibe */
+@plugin "daisyui/theme" {
+	name: 'ripper';
+	default: true;
+	prefersdark: true;
+	color-scheme: dark;
+
+	--color-base-100: oklch(18% 0.03 265);
+	--color-base-200: oklch(15% 0.03 265);
+	--color-base-300: oklch(12% 0.03 265);
+	--color-base-content: oklch(92% 0.02 265);
+
+	--color-primary: oklch(70% 0.19 300);
+	--color-primary-content: oklch(14% 0.03 300);
+	--color-secondary: oklch(72% 0.16 200);
+	--color-secondary-content: oklch(14% 0.03 200);
+	--color-accent: oklch(82% 0.17 85);
+	--color-accent-content: oklch(20% 0.05 85);
+	--color-neutral: oklch(24% 0.03 265);
+	--color-neutral-content: oklch(92% 0.02 265);
+
+	--color-info: oklch(72% 0.14 230);
+	--color-info-content: oklch(14% 0.03 230);
+	--color-success: oklch(72% 0.18 150);
+	--color-success-content: oklch(14% 0.03 150);
+	--color-warning: oklch(82% 0.17 85);
+	--color-warning-content: oklch(20% 0.05 85);
+	--color-error: oklch(66% 0.22 20);
+	--color-error-content: oklch(14% 0.03 20);
+
+	--radius-selector: 1rem;
+	--radius-field: 0.75rem;
+	--radius-box: 1.25rem;
+	--size-selector: 0.28125rem;
+	--size-field: 0.28125rem;
+	--border: 1px;
+	--depth: 1;
+	--noise: 0;
+}
+
+html,
+body {
+	min-height: 100dvh;
+	overscroll-behavior-y: none;
+}
+
+body {
+	background:
+		radial-gradient(1200px 800px at 80% -10%, oklch(30% 0.12 300 / 0.35), transparent 60%),
+		radial-gradient(1000px 700px at -10% 20%, oklch(30% 0.1 220 / 0.3), transparent 55%),
+		var(--color-base-300);
+}
+
+/* Foil shimmer used on rare/mythic/foil cards */
+.foil-shimmer {
+	position: relative;
+	overflow: hidden;
+}
+.foil-shimmer::after {
+	content: '';
+	position: absolute;
+	inset: 0;
+	background: linear-gradient(
+		115deg,
+		transparent 20%,
+		oklch(90% 0.2 200 / 0.35) 40%,
+		oklch(90% 0.2 320 / 0.4) 50%,
+		oklch(90% 0.2 90 / 0.35) 60%,
+		transparent 80%
+	);
+	background-size: 300% 300%;
+	mix-blend-mode: screen;
+	animation: foil 3.5s ease-in-out infinite;
+	pointer-events: none;
+}
+@keyframes foil {
+	0% {
+		background-position: 0% 50%;
+	}
+	100% {
+		background-position: 100% 50%;
+	}
+}
+
+.rarity-glow-rare {
+	box-shadow: 0 0 24px oklch(82% 0.17 85 / 0.5);
+}
+.rarity-glow-mythic {
+	box-shadow: 0 0 30px oklch(70% 0.22 40 / 0.65);
+}
+
+/* Hide scrollbars on horizontal swipe rows */
+.no-scrollbar {
+	-ms-overflow-style: none;
+	scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+	display: none;
+}
+
+/* Safe-area padding for mobile bottom nav */
+.pb-safe {
+	padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 4.5rem);
+}
