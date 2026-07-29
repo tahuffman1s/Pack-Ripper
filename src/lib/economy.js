@@ -8,7 +8,7 @@
  * (from their real-world MSRP) and to value cards (from Scryfall USD prices).
  */
 
-export const STARTING_GOLD = 1000;
+export const STARTING_GOLD = 100_000;
 
 /** 100 gold per US dollar. */
 export const GOLD_PER_USD = 100;

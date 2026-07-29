@@ -29,16 +29,20 @@
 
 <svelte:head><title>Store · PackRipper</title></svelte:head>
 
-<div class="mb-3">
-	<h1 class="text-2xl font-black">Store</h1>
-	<p class="text-base-content/60 text-sm">{data.count} sets from 1993 to today · live <span class="text-success font-semibold">TCGplayer</span> market prices.</p>
-</div>
+<!-- Desktop puts the search beside the title rather than under it, so the first
+     row of sets is above the fold. -->
+<div class="lg:mb-5 lg:flex lg:items-end lg:justify-between lg:gap-8">
+	<div class="mb-3 lg:mb-0">
+		<h1 class="text-2xl lg:text-3xl font-black">Store</h1>
+		<p class="text-base-content/60 text-sm">{data.count} sets from 1993 to today · live <span class="text-success font-semibold">TCGplayer</span> market prices.</p>
+	</div>
 
-<label class="input input-bordered flex items-center gap-2 mb-4 sticky top-16 z-20 bg-base-100/90 backdrop-blur">
-	<svg class="size-4 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4" stroke-linecap="round"/></svg>
-	<input bind:value={q} type="search" class="grow" placeholder="Search {data.count} sets…" />
-	{#if q}<button class="text-xs text-base-content/50" onclick={() => (q = '')}>clear</button>{/if}
-</label>
+	<label class="input input-bordered flex items-center gap-2 mb-4 lg:mb-0 lg:w-80 lg:shrink-0 sticky top-16 lg:top-0 z-20 bg-base-100/90 backdrop-blur">
+		<svg class="size-4 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4" stroke-linecap="round"/></svg>
+		<input bind:value={q} type="search" class="grow" placeholder="Search {data.count} sets…" />
+		{#if q}<button class="text-xs text-base-content/50" onclick={() => (q = '')}>clear</button>{/if}
+	</label>
+</div>
 
 {#if shown === 0}
 	<p class="text-center text-base-content/50 py-10">No sets match “{q}”.</p>
@@ -52,7 +56,7 @@
 			<span class="text-xs text-base-content/30">{group.sets.length}</span>
 		</div>
 
-		<div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+		<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-2.5">
 			{#each group.sets as set (set.code)}
 				<a
 					href="/store/{set.code}"

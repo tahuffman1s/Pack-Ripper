@@ -116,8 +116,9 @@ export const ROWS = 3;
 
 /**
  * Row index each reel contributes, left to right. Row 0 is the top of the
- * window, which is the stop BEFORE the landed one (the reel curves upward);
- * row 2 is the stop after it.
+ * window, which is the stop BEFORE the landed one; row 2 is the stop after it.
+ * The renderer draws the strip in this order too, so what is on screen and what
+ * the server scored are the same three rows.
  */
 export const PAYLINES = [
 	{ name: 'Middle', rows: [1, 1, 1] },

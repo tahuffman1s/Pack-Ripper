@@ -66,7 +66,7 @@
 <svelte:head><title>Packs · PackRipper</title></svelte:head>
 
 <div class="mb-5">
-	<h1 class="text-2xl font-black">Your Vault</h1>
+	<h1 class="text-2xl lg:text-3xl font-black">Your Vault</h1>
 	<p class="text-base-content/60 text-sm">Unopened sealed product. Tap to rip — or sell back at value.</p>
 </div>
 
@@ -80,7 +80,7 @@
 		</div>
 	</div>
 {:else}
-	<div class="grid grid-cols-2 gap-3">
+	<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5 gap-3">
 		{#each data.groups as g (g.key)}
 			<div class="relative card bg-base-100/70 border border-white/10 {accentBorder[g.accent]} transition-colors shadow-lg overflow-hidden">
 				<button onclick={() => openGroup(g)} class="text-left active:scale-[0.98] transition-transform">
@@ -123,7 +123,8 @@
 {#if data.recent.length}
 	<div class="mt-8">
 		<h2 class="text-sm font-bold text-base-content/60 uppercase tracking-wide mb-2">Recent rips</h2>
-		<div class="flex flex-col gap-1.5">
+		<!-- A single tall list wastes a wide screen; break it into columns instead. -->
+		<div class="flex flex-col gap-1.5 lg:grid lg:grid-cols-2 2xl:grid-cols-3">
 			{#each data.recent as r (r.id)}
 				<div class="flex items-center justify-between text-sm bg-base-100/50 rounded-lg px-3 py-2">
 					<span class="truncate">{r.setName}</span>

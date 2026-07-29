@@ -6,14 +6,13 @@ export const actions = {
 	default: async ({ request, cookies }) => {
 		const form = await request.formData();
 		const username = String(form.get('username') || '');
-		const email = String(form.get('email') || '');
 		const password = String(form.get('password') || '');
 
 		let user;
 		try {
-			user = createUser({ username, email, password });
+			user = createUser({ username, password });
 		} catch (e) {
-			return fail(400, { username, email, error: e.message || 'Could not create account.' });
+			return fail(400, { username, error: e.message || 'Could not create account.' });
 		}
 		const token = createSession(user.id);
 		cookies.set(SESSION_COOKIE, token, sessionCookieOptions());

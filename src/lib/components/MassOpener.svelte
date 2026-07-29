@@ -136,7 +136,7 @@
 
 	<!-- SUMMARY -->
 	{#if phase === 'summary' && result}
-		<div class="flex-1 min-h-0 overflow-y-auto px-5 py-4 mx-auto w-full max-w-2xl">
+		<div class="flex-1 min-h-0 overflow-y-auto px-5 py-4 mx-auto w-full max-w-2xl lg:max-w-5xl">
 			<div class="text-center mb-4">
 				<div class="text-sm text-base-content/50 uppercase tracking-widest">
 					{result.packsOpened} packs · {cards.length} cards
@@ -183,7 +183,7 @@
 			<h3 class="text-sm font-bold text-base-content/60 uppercase tracking-wide mb-2">
 				Top pulls
 			</h3>
-			<div class="grid grid-cols-4 sm:grid-cols-5 gap-1.5 mb-4">
+			<div class="grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-8 xl:grid-cols-10 gap-1.5 lg:gap-2 mb-4">
 				{#each (showAll ? sorted : hits.slice(0, 20)) as card (card.uid)}
 					{@const r = rarityInfo(card.rarity)}
 					{@const treat = treatmentInfo(topTreatment(card))}
@@ -227,7 +227,7 @@
 			{/if}
 		</div>
 
-		<div class="shrink-0 p-4 grid grid-cols-2 gap-2">
+		<div class="shrink-0 p-4 grid grid-cols-2 gap-2 mx-auto w-full max-w-2xl">
 			<button class="btn btn-ghost" onclick={onclose}>Done</button>
 			<a class="btn btn-primary" href="/collection">View collection</a>
 		</div>

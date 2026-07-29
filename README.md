@@ -10,7 +10,8 @@ It's a simulator: the currency is free and no real money is ever involved.
 ## Features
 
 - **Login system** — username/password accounts with hashed passwords (scrypt) and session
-  cookies. Every new account starts with **1,000 free gold**.
+  cookies — username and password only, nothing else asked for. Every new account starts with
+  **100,000 free gold**.
 - **Store** — every booster-eligible MTG set from 1993 to today, each offering the booster
   products it actually shipped with:
   - **Draft Boosters** (classic 15-card packs, pre-2024)
@@ -59,12 +60,14 @@ It's a simulator: the currency is free and no real money is ever involved.
   real TCGplayer sealed-market prices** (via tcgcsv.com) — a Tempest booster really costs ~🪙10,040
   ($100), a modern pack ~🪙500. Card values come from live Scryfall USD prices. Sell at an 85%
   buylist rate. Sets without a live listing fall back to an MSRP×vintage estimate (shown with ≈).
-- **Mana Machine** — a 3D slot machine: 3 reels × 3 rows, **5 paylines**, and a **free-spin bonus
-  round**. Reels are drums of 24 physical stops built in three.js; odds come from how often a symbol
-  appears on its reel strip, the same way a mechanical slot works — and the same way pack collation
-  works here. Because the 3×3 window is fully determined by the three reel stops, the whole game is
-  still solvable exactly: `node scripts/verify-slots.mjs` enumerates all 24³ = 13,824 outcomes across
-  every payline and the bonus round.
+- **Mana Machine** — a 2D slot machine: 3 reels × 3 rows, **5 paylines**, and a **free-spin bonus
+  round**. Each reel is a strip of 24 physical stops scrolled behind a three-row window in plain
+  DOM and CSS; odds come from how often a symbol appears on its reel strip, the same way a mechanical
+  slot works — and the same way pack collation works here. Winning cells light up in place and the
+  paylines are traced across the window, so the reels *are* the result readout. Because the 3×3
+  window is fully determined by the three reel stops, the whole game is solvable exactly:
+  `node scripts/verify-slots.mjs` enumerates all 24³ = 13,824 outcomes across every payline and the
+  bonus round.
 
   | | |
   |---|---|
@@ -137,6 +140,9 @@ It's a simulator: the currency is free and no real money is ever involved.
   and sell singles or bulk-select for a mass sale.
 - **Stats** — packs/boxes opened, cards opened/sold, gold spent/earned, net profit, mythics /
   rares / foils pulled, best pull ever, collection value, and most-opened sets.
+- **Admin panel + CLI** — hand out gold and packs, promote admins, reset passwords, delete
+  accounts. Same actions from `/admin` in the browser or `./admin.sh` on the host, every one of
+  them written to an audit trail. See [Admin](#admin).
 - **Mobile-first UI** with DaisyUI on a custom arcane/foil dark theme.
 
 ## Tech stack
@@ -197,6 +203,87 @@ whole server into `build/`, whose only imports are `node:` builtins.
 
 `docker-compose.yml` does the same thing for anyone who has a compose provider.
 
+## Admin
+
+There is a panel at **`/admin`** and a CLI at **`./admin.sh`**. Both do the same things — give a
+player gold, drop packs into their vault, promote another admin, reset a password, sign someone
+out, clear a wedged blackjack hand, delete an account — and both go through one dispatch table in
+`src/lib/server/admin.js`, so they cannot drift apart. Every action is appended to an audit trail
+that the panel shows at the bottom of the page and `./admin.sh log` prints.
+
+Two environment variables control access. Both are **empty by default, and empty means the door is
+off rather than unlocked**:
+
+| Variable | What it does |
+|---|---|
+| `ADMIN_USERNAMES` | Comma-separated accounts that are admins regardless of the database. The panel appears in their nav; `/admin` is a **404** for everyone else. |
+| `ADMIN_TOKEN` | Shared secret for `./admin.sh`. Unset, the CLI cannot authenticate and the panel is the only way in. |
+
+`ADMIN_USERNAMES` is the bootstrap, and it exists because a fresh database has no admins and
+nothing in the UI can promote the first one. It applies at sign-in and does not care whether the
+account exists yet, so you can set it before registering. Everyone promoted afterwards is flagged
+in the database and needs no variable.
+
+### Setting it up
+
+```bash
+./admin.sh token                  # generates a value for ADMIN_TOKEN
+```
+
+Put both variables where that copy of the app reads its environment — `.env` locally (`run.sh` and
+`docker-compose.yml` both pass them through), or the Container App's environment variables in
+Azure — then restart. `./run.sh restart` locally; a new revision in the Portal.
+
+### Commands
+
+```bash
+./admin.sh help                       # every command
+./admin.sh status                     # health, totals, uptime
+./admin.sh list                       # every account, richest first
+./admin.sh show travis                # one account in full
+./admin.sh admin travis               # grant admin (./admin.sh admin travis off revokes)
+./admin.sh gold travis 50000          # add gold; a negative amount takes it away
+./admin.sh gold travis 1000 --set     # set the balance outright
+./admin.sh packs travis fdn play 36   # grant a box of Foundations Play Boosters, free
+./admin.sh passwd travis newsecret    # set a password, signing them out everywhere
+./admin.sh unstick travis             # clear a wedged blackjack hand / free spins
+./admin.sh delete someone --yes       # delete an account and everything on it
+./admin.sh log                        # the audit trail
+```
+
+It talks to a **running** app over HTTP — `http://127.0.0.1:$PORT` by default, `--url` or
+`PACKRIPPER_URL` for anything else, so the Azure copy is administered from here with
+`--url https://<hostname>`. `--json` prints raw JSON for piping into `jq`.
+
+The image also carries the script at `/app/admin.mjs`, for a host with no checkout:
+
+```bash
+podman exec packripper node /app/admin.mjs list      # or ./admin.sh list --in-container
+```
+
+`--in-container` is what `./admin.sh` falls back to when this machine has no `node` at all. It
+looks for a container called `packripper`; set `PACKRIPPER_CONTAINER` if yours is named something
+else. Set `ADMIN_ACTOR` there too — inside the container the OS user is `root`, which makes for a
+dull audit trail.
+
+Three details that are deliberate rather than incidental:
+
+- **The CLI does not edit `.data/db.json`.** `db.js` keeps the whole database in memory and writes
+  all of it back on every mutation, so a second process editing that file would have its work
+  silently overwritten by the next thing any player did. Going through the app is the only way a
+  change sticks — which is also why the CLI needs the app up.
+- **`/admin` and `/api/admin` answer 404, not 403,** to anyone who is not an admin. A "forbidden"
+  tells whoever guessed the URL that there is something there worth attacking. The panel is linked
+  in the nav for admins, so nobody who should be there has to guess.
+- **Granted gold is kept out of the player's earned/spent figures.** Folding it into
+  `stats.goldEarned` would make their own net-profit number a lie; it lands in the audit trail and
+  a separate running total instead. There are guards against locking yourself out, too: you cannot
+  revoke your own admin, delete the account you are signed in as, or remove the last admin.
+
+Actions are logged with who did them. A panel action records the admin's username; a CLI action
+records `cli:<operator>`, taken from `ADMIN_ACTOR` or the OS user, so a shared host still shows
+which person ran the command.
+
 ## The image, on GHCR
 
 `.github/workflows/publish-image.yml` builds the runtime image on every push to `main` and
@@ -250,7 +337,9 @@ Four things the create form will not prompt for, each of which breaks something 
   SvelteKit refuses any POST whose `Origin` header disagrees with the origin it believes it is
   serving, so a missing or wrong value does not break pages — it breaks every login and every
   purchase while everything keeps looking fine. The rest of the environment is
-  `NODE_ENV=production`, `HOST=0.0.0.0`, `PORT=3000`, `BODY_SIZE_LIMIT=2M`.
+  `NODE_ENV=production`, `HOST=0.0.0.0`, `PORT=3000`, `BODY_SIZE_LIMIT=2M`, plus
+  `ADMIN_USERNAMES` and `ADMIN_TOKEN` if you want the [admin panel and CLI](#admin) — without the
+  first of those, the hosted copy has no admins and no way to appoint one.
 - **A volume mounted at `/app/.data`** (Azure Files). That is the entire database — accounts,
   collections, wallets, the serial-number ledger. Without it, every revision and every restart
   starts empty.
@@ -297,6 +386,7 @@ src/
     cards.js              client card helpers (rarity, images, values)
     components/
       Pack3D.svelte       the animated three.js booster pack
+      SlotMachine2D.svelte  the scrolling reels, win frames and payline traces
       PlayingCard.svelte  a blackjack card face
       PackOpener.svelte   full-screen rip + swipe-reveal experience
       CardTile.svelte     a card face for grids
@@ -316,6 +406,7 @@ src/
       rescue.js           net-worth check + Bulk Bin failsafe grant
       registry.js         in-memory set index, annotated with real products
       game.js             buy / open / sell / stats orchestration
+      admin.js            every privileged action, in one dispatch table
   routes/
     +layout.svelte        app shell (top bar + bottom nav)
     (login|register|logout)
@@ -326,10 +417,14 @@ src/
     blackjack/            the blackjack table
     collection/           owned cards + selling
     stats/                statistics
+    admin/                the admin panel (404 unless you are one)
     api/(open|sell|spin| JSON endpoints for the interactive flows
         rescue|blackjack)
+    api/admin/            the one admin entry point (session cookie or ADMIN_TOKEN)
     api/health/           liveness, for HEALTHCHECK and the Azure probes
+admin.sh                  admin commands, for the container host
 scripts/
+  admin.mjs               the admin CLI itself (also shipped in the image)
   verify-odds.mjs         odds regression harness vs published figures
   verify-slots.mjs        exact slot RTP / paytable verification
   verify-blackjack.mjs    hand evaluation, shuffle bias, measured house edge
@@ -346,6 +441,7 @@ scripts/
 - The set line-up (and which products each set offers) lives in `src/lib/catalog.js`.
 - Card data is cached for 14 days under `.cache/`; collation slices for 90 days (collation
   never changes once a set is released). Delete `.cache/` to refresh.
+- Admin access is `ADMIN_USERNAMES` and `ADMIN_TOKEN`, both off when unset — see [Admin](#admin).
 
 ### Accuracy, honestly stated
 

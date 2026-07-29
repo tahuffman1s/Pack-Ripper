@@ -195,7 +195,7 @@
 						{card.slotLabel || `Card ${i + 1} of ${cards.length}`}
 					</div>
 					<div
-						class="relative w-[68vw] max-w-[280px] aspect-[5/7] rounded-2xl overflow-hidden shadow-2xl {card.foil
+						class="relative w-[68vw] max-w-[280px] lg:max-w-[340px] aspect-[5/7] rounded-2xl overflow-hidden shadow-2xl {card.foil
 							? 'foil-shimmer'
 							: ''} {r.ring}"
 					>
@@ -257,7 +257,7 @@
 
 	<!-- SUMMARY -->
 	{#if phase === 'summary'}
-		<div class="flex-1 min-h-0 overflow-y-auto px-5 py-4 mx-auto w-full max-w-2xl">
+		<div class="flex-1 min-h-0 overflow-y-auto px-5 py-4 mx-auto w-full max-w-2xl lg:max-w-5xl">
 			<div class="text-center mb-4">
 				<div class="text-sm text-base-content/50 uppercase tracking-widest">Pack value</div>
 				<div class="text-4xl font-black text-accent">🪙 {formatGold(summary.total)}</div>
@@ -313,7 +313,7 @@
 
 			<!-- `small` is 146px wide; a grid cell is 2-3× that once devicePixelRatio
 			     is applied, so these need `normal` to stay sharp. -->
-			<div class="grid grid-cols-4 sm:grid-cols-5 gap-1.5">
+			<div class="grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-8 xl:grid-cols-10 gap-1.5 lg:gap-2">
 				{#each [...cards].sort((a, b) => marketGold(b) - marketGold(a)) as card (card.uid)}
 					{@const r = rarityInfo(card.rarity)}
 					<div class="aspect-[5/7] rounded-md overflow-hidden {card.foil ? 'foil-shimmer' : ''} {r.ring}">
@@ -327,7 +327,7 @@
 			</div>
 		</div>
 
-		<div class="shrink-0 p-4 grid grid-cols-2 gap-2">
+		<div class="shrink-0 p-4 grid grid-cols-2 gap-2 mx-auto w-full max-w-2xl">
 			<button class="btn btn-ghost" onclick={onclose}>Done</button>
 			<button class="btn btn-primary" onclick={openAnother} disabled={!queue.length}>
 				{queue.length ? `Open next (${queue.length})` : 'No more'}

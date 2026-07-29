@@ -22,6 +22,9 @@ package
 # out means an edit to the README does not invalidate the npm ci layer.
 README.md
 scripts
+# …except the admin CLI, which the runtime stage copies to /app/admin.mjs so it
+# can be run with `exec` on a host that has no checkout.
+!scripts/admin.mjs
 
 .env
 .env.*

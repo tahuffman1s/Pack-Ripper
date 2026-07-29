@@ -77,6 +77,13 @@ fi
 PORT="${PORT:-3000}"
 BODY_SIZE_LIMIT="${BODY_SIZE_LIMIT:-2M}"
 
+# Admin access. Both are optional and both are empty by default, which turns the
+# corresponding door off rather than leaving it unlocked: no ADMIN_TOKEN means
+# ./admin.sh cannot authenticate at all, and no ADMIN_USERNAMES means the only
+# admins are the ones already flagged in the database.
+ADMIN_TOKEN="${ADMIN_TOKEN:-}"
+ADMIN_USERNAMES="${ADMIN_USERNAMES:-}"
+
 # Set IMAGE (in .env or the environment) to ghcr.io/tahuffman1s/pack-ripper:latest
 # to run the published image instead of a locally built one.
 IMAGE="${IMAGE:-$DEFAULT_IMAGE}"
@@ -142,6 +149,8 @@ start_app() {
 		--env "PORT=3000" \
 		--env "BODY_SIZE_LIMIT=${BODY_SIZE_LIMIT}" \
 		--env "ORIGIN=http://localhost:${PORT}" \
+		--env "ADMIN_TOKEN=${ADMIN_TOKEN}" \
+		--env "ADMIN_USERNAMES=${ADMIN_USERNAMES}" \
 		--volume "$PWD/.data:/app/.data${MOUNT_SUFFIX}" \
 		--volume "$PWD/.cache:/app/.cache${MOUNT_SUFFIX}" \
 		"$IMAGE" >/dev/null

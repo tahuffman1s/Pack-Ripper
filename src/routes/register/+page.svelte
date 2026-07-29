@@ -1,5 +1,6 @@
 <script>
 	import { enhance } from '$app/forms';
+	import { STARTING_GOLD, formatGold } from '$lib/economy.js';
 	let { form } = $props();
 	let loading = $state(false);
 </script>
@@ -26,7 +27,7 @@
 			class="card bg-base-100/70 backdrop-blur border border-white/5 shadow-xl"
 		>
 			<div class="card-body gap-4">
-				<h2 class="card-title">Sign up — get 1,000 gold</h2>
+				<h2 class="card-title">Sign up — get {formatGold(STARTING_GOLD)} gold</h2>
 
 				{#if form?.error}
 					<div class="alert alert-error text-sm py-2">{form.error}</div>
@@ -36,12 +37,6 @@
 					<span>Username</span>
 					<input name="username" value={form?.username ?? ''} required autocomplete="username"
 						class="input input-bordered w-full" placeholder="3–20 letters/numbers" />
-				</label>
-
-				<label class="floating-label">
-					<span>Email (optional)</span>
-					<input name="email" type="email" value={form?.email ?? ''} autocomplete="email"
-						class="input input-bordered w-full" placeholder="you@example.com" />
 				</label>
 
 				<label class="floating-label">

@@ -33,6 +33,12 @@ RUN apk add --no-cache curl
 
 COPY --from=build /app/build ./build
 
+# The admin CLI, so `podman exec packripper node /app/admin.mjs ...` works on a
+# host that has no copy of the repo — the Azure console, for instance. It is a
+# dependency-free script that talks to the app over loopback; it carries no
+# privileges of its own and does nothing without ADMIN_TOKEN set.
+COPY scripts/admin.mjs ./admin.mjs
+
 # Bind-mounted by run.sh / compose; in Azure only .data is mounted, from a file
 # share. Declared anyway so an unmounted container still boots (it just starts
 # with an empty vault and a cold cache).

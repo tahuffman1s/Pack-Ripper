@@ -143,7 +143,7 @@
 
 <div class="flex items-end justify-between mb-3">
 	<div>
-		<h1 class="text-2xl font-black">Collection</h1>
+		<h1 class="text-2xl lg:text-3xl font-black">Collection</h1>
 		<p class="text-base-content/60 text-sm">
 			{data.cards.length.toLocaleString()} cards · worth 🪙 {formatGold(data.value)}
 		</p>
@@ -166,7 +166,7 @@
 	</div>
 {:else}
 	<!-- controls -->
-	<div class="flex gap-2 overflow-x-auto no-scrollbar pb-2 mb-2 -mx-1 px-1">
+	<div class="flex gap-2 overflow-x-auto no-scrollbar pb-2 mb-2 -mx-1 px-1 lg:overflow-visible lg:mx-0 lg:px-0 lg:gap-3">
 		<div class="join">
 			<button class="join-item btn btn-xs {filter === 'all' ? 'btn-primary' : 'btn-ghost'}" onclick={() => (filter = 'all')}>All</button>
 			<button class="join-item btn btn-xs {filter === 'rareplus' ? 'btn-primary' : 'btn-ghost'}" onclick={() => (filter = 'rareplus')}>Rare+</button>
@@ -189,7 +189,7 @@
 		<p class="text-xs text-base-content/50 mb-2">{filtered.length.toLocaleString()} matching</p>
 	{/if}
 
-	<div class="grid grid-cols-3 sm:grid-cols-4 gap-2 pb-2">
+	<div class="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-7 2xl:grid-cols-9 gap-2 lg:gap-3 pb-2">
 		{#each visible as card (card.uid)}
 			<CardTile
 				{card}
@@ -213,8 +213,9 @@
 
 <!-- selection action bar -->
 {#if selectMode}
-	<div class="fixed inset-x-0 bottom-0 z-40 p-3 pb-safe">
-		<div class="mx-auto max-w-2xl card bg-base-100 border border-primary/40 shadow-2xl">
+	<!-- The bar spans the page, not the viewport: on desktop it has to clear the rail. -->
+	<div class="fixed inset-x-0 bottom-0 z-40 p-3 pb-safe lg:pb-3 lg:pl-60 xl:pl-64">
+		<div class="mx-auto max-w-2xl lg:max-w-3xl card bg-base-100 border border-primary/40 shadow-2xl">
 			<div class="card-body p-3 flex-row items-center gap-2">
 				<div class="flex-1 min-w-0">
 					<div class="font-bold">{selected.size.toLocaleString()} selected</div>
@@ -239,9 +240,9 @@
 {#if detail}
 	{@const r = rarityInfo(detail.rarity)}
 	<div class="modal modal-open" role="dialog" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) detail = null; }} onkeydown={(e)=> e.key==='Escape' && (detail=null)}>
-		<div class="modal-box max-w-sm">
-			<div class="flex gap-4">
-				<div class="w-32 shrink-0 aspect-[5/7] rounded-xl overflow-hidden {detail.foil ? 'foil-shimmer' : ''} {r.ring}">
+		<div class="modal-box max-w-sm lg:max-w-lg">
+			<div class="flex gap-4 lg:gap-6">
+				<div class="w-32 lg:w-44 shrink-0 aspect-[5/7] rounded-xl overflow-hidden {detail.foil ? 'foil-shimmer' : ''} {r.ring}">
 					{#if cardImage(detail)}
 						<img src={cardImage(detail, 'normal')} alt={detail.name} class="w-full h-full object-cover" />
 					{/if}

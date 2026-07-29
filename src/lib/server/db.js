@@ -14,7 +14,7 @@ const DATA_DIR = join(process.cwd(), '.data');
 const DB_PATH = join(DATA_DIR, 'db.json');
 
 const DEFAULT_DB = {
-	users: {}, // id -> { id, username, email, passwordHash, salt, createdAt }
+	users: {}, // id -> { id, username, passwordHash, salt, createdAt, admin? }
 	usernames: {}, // lowercased username -> userId
 	sessions: {}, // token -> { userId, createdAt }
 	wallets: {}, // userId -> { gold }
@@ -24,7 +24,8 @@ const DEFAULT_DB = {
 	openings: {}, // userId -> [ recent opening summaries ]
 	serials: {}, // scryfallId -> [ issued serial numbers ]  (a 1/1 exists once, globally)
 	freeSpins: {}, // userId -> { remaining, lineBet, lines }  (slot bonus round)
-	blackjack: {} // userId -> { shoe, phase, dealer, hands, active }  (table in play)
+	blackjack: {}, // userId -> { shoe, phase, dealer, hands, active }  (table in play)
+	adminLog: [] // newest-first audit trail of admin actions (capped)
 };
 
 let db = null;

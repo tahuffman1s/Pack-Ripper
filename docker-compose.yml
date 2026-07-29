@@ -24,6 +24,11 @@ services:
       # it thinks it is serving, so a wrong value here does not break pages — it
       # breaks every login and purchase. Pin it to the address you type.
       ORIGIN: http://localhost:${PORT:-3000}
+      # Admin access. Empty means off, not open: with no ADMIN_TOKEN the admin
+      # CLI cannot authenticate, and with no ADMIN_USERNAMES the only admins are
+      # the ones already flagged in the database. See ./admin.sh.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      ADMIN_USERNAMES: ${ADMIN_USERNAMES:-}
     volumes:
       # :z — SELinux is enforcing on Fedora, and a shared label (not :Z) keeps
       # these usable by a natively-run `npm run dev` against the same data.

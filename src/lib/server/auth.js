@@ -5,13 +5,40 @@ import { STARTING_GOLD } from '../economy.js';
 export const SESSION_COOKIE = 'ripper_session';
 const SESSION_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
 
+export const MIN_PASSWORD = 6;
+
+/**
+ * Accounts that are admins because the environment says so, regardless of what
+ * is stored on them. This is the bootstrap: a brand-new database has no admins
+ * and nothing in the UI can promote the first one, so
+ * `ADMIN_USERNAMES=travis,someone` on the container promotes them at sign-in —
+ * before the account exists, if you like. Everyone else is promoted from the
+ * panel, which sets `admin: true` on the user record.
+ */
+const ENV_ADMINS = new Set(
+	String(process.env.ADMIN_USERNAMES || '')
+		.split(',')
+		.map((s) => s.trim().toLowerCase())
+		.filter(Boolean)
+);
+
+/** Whether a stored user record is an admin. */
+export function isAdminUser(user) {
+	if (!user) return false;
+	return user.admin === true || ENV_ADMINS.has(String(user.username || '').toLowerCase());
+}
+
+/** Admins named by the environment, so the panel can say the flag is not editable. */
+export function envAdminNames() {
+	return [...ENV_ADMINS];
+}
+
 function hashPassword(password, salt) {
 	return scryptSync(password, salt, 64).toString('hex');
 }
 
-export function createUser({ username, email, password }) {
+export function createUser({ username, password }) {
 	username = String(username || '').trim();
-	email = String(email || '').trim();
 	const key = username.toLowerCase();
 
 	if (username.length < 3 || username.length > 20) {
@@ -20,8 +47,8 @@ export function createUser({ username, email, password }) {
 	if (!/^[a-zA-Z0-9_]+$/.test(username)) {
 		throw new Error('Username may only contain letters, numbers and underscores.');
 	}
-	if (String(password || '').length < 6) {
-		throw new Error('Password must be at least 6 characters.');
+	if (String(password || '').length < MIN_PASSWORD) {
+		throw new Error(`Password must be at least ${MIN_PASSWORD} characters.`);
 	}
 
 	const db = getDb();
@@ -35,7 +62,7 @@ export function createUser({ username, email, password }) {
 	const now = Date.now();
 
 	mutate((d) => {
-		d.users[id] = { id, username, email, passwordHash, salt, createdAt: now };
+		d.users[id] = { id, username, passwordHash, salt, createdAt: now };
 		d.usernames[key] = id;
 		d.wallets[id] = { gold: STARTING_GOLD };
 		d.inventory[id] = [];
@@ -81,6 +108,39 @@ export function verifyUser(username, password) {
 	return user;
 }
 
+/**
+ * Replace an account's password, salt and all. Used by the admin panel and the
+ * admin CLI; hashing stays in this module so there is exactly one place that
+ * knows how a stored credential is derived.
+ */
+export function setPassword(userId, password) {
+	if (String(password || '').length < MIN_PASSWORD) {
+		throw new Error(`Password must be at least ${MIN_PASSWORD} characters.`);
+	}
+	const salt = randomBytes(16).toString('hex');
+	const passwordHash = hashPassword(password, salt);
+	mutate((d) => {
+		const user = d.users[userId];
+		if (!user) throw new Error('No such account.');
+		user.salt = salt;
+		user.passwordHash = passwordHash;
+	});
+}
+
+/** Drop every session belonging to a user — signs them out everywhere. */
+export function revokeSessions(userId) {
+	let n = 0;
+	mutate((d) => {
+		for (const [token, s] of Object.entries(d.sessions)) {
+			if (s.userId === userId) {
+				delete d.sessions[token];
+				n++;
+			}
+		}
+	});
+	return n;
+}
+
 export function createSession(userId) {
 	const token = randomBytes(32).toString('hex');
 	mutate((d) => {
@@ -103,7 +163,12 @@ export function getUserFromSession(token) {
 	if (!session) return null;
 	const user = db.users[session.userId];
 	if (!user) return null;
-	return { id: user.id, username: user.username, email: user.email, createdAt: user.createdAt };
+	return {
+		id: user.id,
+		username: user.username,
+		createdAt: user.createdAt,
+		admin: isAdminUser(user)
+	};
 }
 
 export function sessionCookieOptions() {

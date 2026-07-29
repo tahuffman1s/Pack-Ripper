@@ -108,3 +108,10 @@ body {
 .pb-safe {
 	padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 4.5rem);
 }
+/* From lg up the bottom nav is replaced by the side rail, so the page only needs
+   ordinary breathing room at the foot. */
+@media (min-width: 64rem) {
+	.pb-safe {
+		padding-bottom: 2.5rem;
+	}
+}

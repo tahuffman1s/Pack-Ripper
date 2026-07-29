@@ -1,6 +1,6 @@
 <script>
 	import { invalidateAll } from '$app/navigation';
-	import SlotMachine3D from '$lib/components/SlotMachine3D.svelte';
+	import SlotMachine2D from '$lib/components/SlotMachine2D.svelte';
 	import {
 		BET_LEVELS,
 		LINE_OPTIONS,
@@ -12,7 +12,6 @@
 		PAYTABLE,
 		SCATTER,
 		SYMBOLS,
-		ROWS,
 		maxAffordableBet,
 		stepBet,
 		totalBet
@@ -26,7 +25,6 @@
 	let result = $state(null);
 	let error = $state(null);
 	let gold = $state(data.wallet?.gold ?? 0);
-	let noWebGL = $state(false);
 	// A bonus round in progress dictates the stake — adopt it so the controls and
 	// the banner show what is actually being played, not a stale local choice.
 	let lines = $state(data.freeSpins?.lines ?? DEFAULT_LINES);
@@ -85,8 +83,10 @@
 				throw new Error(body.message || 'Could not spin.');
 			}
 			held = await res.json();
-			if (noWebGL) setTimeout(settle, 900);
-			else machine?.spinTo(held.stops);
+			// The spin already happened on the server; if the reels somehow are not
+			// mounted, settle anyway rather than leaving the page stuck spinning.
+			if (machine) machine.spinTo(held.stops);
+			else settle();
 		} catch (e) {
 			error = e.message;
 			spinning = false;
@@ -139,299 +139,294 @@
 
 <svelte:head><title>Mana Machine · PackRipper</title></svelte:head>
 
-<div class="space-y-4 pb-24">
-	<div>
-		<h1 class="text-2xl font-black tracking-tight">Mana Machine</h1>
-		<p class="text-sm text-base-content/50">
-			3 reels × 3 rows, {PAYLINES.length} paylines, free spins.
-		</p>
-	</div>
-
-	{#if freeLeft > 0}
-		<div class="rounded-2xl border border-fuchsia-400/50 bg-gradient-to-r from-fuchsia-500/20 to-cyan-400/20 px-4 py-3 flex items-center justify-between gap-3">
-			<div>
-				<div class="font-black tracking-wide">FREE SPINS</div>
-				<div class="text-xs text-base-content/60">
-					{lockedStake?.lines ?? lines}
-					{(lockedStake?.lines ?? lines) === 1 ? 'line' : 'lines'} at 🪙{formatGold(lockedStake?.lineBet ?? bet)} — locked in, costs nothing
-				</div>
-			</div>
-			<div class="text-3xl font-black tabular-nums text-fuchsia-300">{freeLeft}</div>
-		</div>
-	{/if}
-
-	<!-- The machine -->
-	<div class="relative rounded-2xl overflow-hidden bg-gradient-to-b from-base-100 to-base-300 border border-white/10 shadow-2xl">
-		<div class="h-[42vh] min-h-[260px] max-h-[380px]">
-			<SlotMachine3D bind:this={machine} onlanded={settle} onnowebgl={() => (noWebGL = true)} />
+<!-- Two zones from xl up: the machine and its readout on the left, everything you
+     touch or look up in a rail on the right. The split follows the document order,
+     so the phone still reads as one column in exactly the old sequence. Below xl
+     there is not enough width for a rail as well as a full-size cabinet, so it
+     stays one (wider, centred) column. -->
+<div class="space-y-4 pb-24 lg:pb-0 xl:grid xl:grid-cols-[minmax(0,1fr)_22rem] 2xl:grid-cols-[minmax(0,1fr)_24rem] xl:gap-6 xl:items-start xl:space-y-0">
+	<div class="space-y-4 xl:sticky xl:top-7">
+		<div>
+			<h1 class="text-2xl lg:text-3xl font-black tracking-tight">Mana Machine</h1>
+			<p class="text-sm text-base-content/50">
+				3 reels × 3 rows, {PAYLINES.length} paylines, free spins.
+			</p>
 		</div>
 
-		{#if result}
-			<div class="absolute inset-x-0 bottom-0 p-3">
-				{#if result.win > 0}
-					<div
-						class="rounded-xl px-4 py-2.5 text-center font-black shadow-xl bg-gradient-to-r from-amber-300 via-fuchsia-400 to-cyan-300 text-black"
-						class:animate-bounce={result.win >= result.stake * 20}
-					>
-						<div class="text-[0.65rem] uppercase tracking-widest opacity-80">
-							{result.scatterHit ? SCATTER.label : result.lineWins[0]?.label}
-							{#if result.lineWins.length > 1}· {result.lineWins.length} lines{/if}
-						</div>
-						<div class="text-2xl">+🪙 {formatGold(result.win)}</div>
-						{#if result.cost > 0 && result.win < result.cost}
-							<div class="text-[0.65rem] opacity-70">less than the 🪙{formatGold(result.cost)} staked</div>
-						{/if}
+		{#if freeLeft > 0}
+			<div class="rounded-2xl border border-fuchsia-400/50 bg-gradient-to-r from-fuchsia-500/20 to-cyan-400/20 px-4 py-3 flex items-center justify-between gap-3">
+				<div>
+					<div class="font-black tracking-wide">FREE SPINS</div>
+					<div class="text-xs text-base-content/60">
+						{lockedStake?.lines ?? lines}
+						{(lockedStake?.lines ?? lines) === 1 ? 'line' : 'lines'} at 🪙{formatGold(lockedStake?.lineBet ?? bet)} — locked in, costs nothing
 					</div>
-				{:else}
-					<div class="rounded-xl px-4 py-2 text-center text-sm bg-base-300/85 text-base-content/60">
-						{result.wasFree ? 'No line — free spin' : `No line — 🪙${formatGold(result.cost)}`}
+				</div>
+				<div class="text-3xl font-black tabular-nums text-fuchsia-300">{freeLeft}</div>
+			</div>
+		{/if}
+
+		<!-- The machine. The reels ARE the result readout now: winning cells light up
+		     in place and the paylines are traced across them, so there is no separate
+		     grid to keep in sync. -->
+		<!-- The cabinet hugs the reels on desktop and centres, rather than stretching a
+		     phone-width picture across the whole column. -->
+		<div class="rounded-2xl overflow-hidden bg-gradient-to-b from-base-100 to-base-300 border border-white/10 shadow-2xl lg:w-fit lg:mx-auto">
+			<SlotMachine2D
+				bind:this={machine}
+				onlanded={settle}
+				lit={litCells}
+				winLines={result?.lineWins ?? []}
+				{lines}
+			/>
+
+			{#if result}
+				<div class="px-3 pb-3">
+					{#if result.win > 0}
+						<div
+							class="rounded-xl px-4 py-2.5 text-center font-black shadow-xl bg-gradient-to-r from-amber-300 via-fuchsia-400 to-cyan-300 text-black"
+							class:animate-bounce={result.win >= result.stake * 20}
+						>
+							<div class="text-[0.65rem] uppercase tracking-widest opacity-80">
+								{result.scatterHit ? SCATTER.label : result.lineWins[0]?.label}
+								{#if result.lineWins.length > 1}· {result.lineWins.length} lines{/if}
+							</div>
+							<div class="text-2xl">+🪙 {formatGold(result.win)}</div>
+							{#if result.cost > 0 && result.win < result.cost}
+								<div class="text-[0.65rem] opacity-70">less than the 🪙{formatGold(result.cost)} staked</div>
+							{/if}
+						</div>
+					{:else}
+						<div class="rounded-xl px-4 py-2 text-center text-sm bg-base-300/85 text-base-content/60">
+							{result.wasFree ? 'No line — free spin' : `No line — 🪙${formatGold(result.cost)}`}
+						</div>
+					{/if}
+				</div>
+			{/if}
+		</div>
+
+		<!-- What paid, line by line -->
+		{#if result && (result.lineWins.length || result.scatterHit)}
+			<div class="rounded-2xl bg-base-100/50 border border-white/5 p-3 text-sm space-y-0.5">
+				{#each result.lineWins as lw}
+					<div class="flex justify-between gap-2">
+						<span class="text-base-content/60 truncate">
+							<span class="font-bold text-base-content/40">{lw.line + 1}</span>
+							{lw.name} · {lw.label}
+						</span>
+						<span class="font-bold text-accent whitespace-nowrap">🪙{formatGold(lw.amount)}</span>
+					</div>
+				{/each}
+				{#if result.scatterHit}
+					<div class="flex justify-between gap-2">
+						<span class="text-fuchsia-300 truncate">
+							{result.scatterCells.length} Boosters
+							{#if result.awardedFreeSpins}· {result.awardedFreeSpins} free spins{/if}
+						</span>
+						<span class="font-bold text-accent whitespace-nowrap">🪙{formatGold(result.scatterWin)}</span>
 					</div>
 				{/if}
 			</div>
 		{/if}
+
+		{#if error}
+			<div class="alert alert-error text-sm py-2">{error}</div>
+		{/if}
 	</div>
 
-	<!-- Result grid: what actually landed, with winning cells lit -->
-	{#if result?.grid}
-		<div class="rounded-2xl bg-base-100/50 border border-white/5 p-3">
-			<div class="flex items-start gap-3">
-				<div class="grid grid-cols-3 gap-1">
-					{#each Array(ROWS) as _, row}
-						{#each result.grid as reelCol, reel}
-							{@const id = reelCol[row]}
-							{@const s = SYMBOLS[id]}
-							{@const lit = litCells.has(`${reel}:${row}`)}
-							<span
-								class="size-9 rounded-md grid place-items-center text-lg border transition-all {lit
-									? 'border-amber-300 ring-2 ring-amber-300/60 scale-105'
-									: 'border-black/20 opacity-40'}"
-								style="background:{s.color};color:{s.text}">{s.glyph}</span
-							>
-						{/each}
+	<div class="space-y-4">
+		<!-- Lines + bet -->
+		<div class="rounded-2xl bg-base-100/60 border border-white/5 p-3 space-y-3" class:opacity-60={freeLeft > 0}>
+			<div class="flex items-center justify-between gap-2">
+				<span class="text-[0.65rem] uppercase tracking-widest text-base-content/40">Paylines</span>
+				<div class="join">
+					{#each LINE_OPTIONS as n}
+						<button
+							class="join-item btn btn-xs {lines === n ? 'btn-primary' : 'btn-ghost'} font-bold"
+							onclick={() => setLines(n)}
+							disabled={spinning || freeLeft > 0}
+						>
+							{n}
+						</button>
 					{/each}
 				</div>
-				<div class="min-w-0 flex-1 text-sm">
-					{#if result.lineWins.length || result.scatterHit}
-						<div class="space-y-0.5">
-							{#each result.lineWins as lw}
-								<div class="flex justify-between gap-2">
-									<span class="text-base-content/60 truncate">{lw.name} · {lw.label}</span>
-									<span class="font-bold text-accent whitespace-nowrap">🪙{formatGold(lw.amount)}</span>
-								</div>
-							{/each}
-							{#if result.scatterHit}
-								<div class="flex justify-between gap-2">
-									<span class="text-fuchsia-300 truncate">
-										{result.scatterCells.length} Boosters
-										{#if result.awardedFreeSpins}· {result.awardedFreeSpins} free spins{/if}
-									</span>
-									<span class="font-bold text-accent whitespace-nowrap">🪙{formatGold(result.scatterWin)}</span>
-								</div>
-							{/if}
-						</div>
-					{:else}
-						<div class="text-base-content/40">No winning line.</div>
-					{/if}
-				</div>
 			</div>
-		</div>
-	{/if}
 
-	{#if error}
-		<div class="alert alert-error text-sm py-2">{error}</div>
-	{/if}
+			<div class="flex items-center justify-between gap-2">
+				<span class="text-[0.65rem] uppercase tracking-widest text-base-content/40">Bet per line</span>
+				<button
+					class="btn btn-xs btn-outline btn-warning font-bold"
+					onclick={betMax}
+					disabled={spinning || freeLeft > 0 || affordable === null || bet === affordable}
+				>
+					MAX
+				</button>
+			</div>
 
-	<!-- Lines + bet -->
-	<div class="rounded-2xl bg-base-100/60 border border-white/5 p-3 space-y-3" class:opacity-60={freeLeft > 0}>
-		<div class="flex items-center justify-between gap-2">
-			<span class="text-[0.65rem] uppercase tracking-widest text-base-content/40">Paylines</span>
-			<div class="join">
-				{#each LINE_OPTIONS as n}
+			<div class="flex items-center gap-3">
+				<button
+					class="btn btn-circle btn-sm btn-ghost text-xl font-black"
+					onclick={() => nudge(-1)}
+					disabled={spinning || freeLeft > 0 || bet === MIN_BET}
+					aria-label="Lower bet">−</button
+				>
+				<div class="flex-1 text-center">
+					<div class="text-xl font-black tabular-nums text-accent leading-none">🪙 {formatGold(bet)}</div>
+					<div class="text-[0.65rem] text-base-content/45 mt-1">
+						× {lines} {lines === 1 ? 'line' : 'lines'} = 🪙{formatGold(stake)} a spin
+					</div>
+				</div>
+				<button
+					class="btn btn-circle btn-sm btn-ghost text-xl font-black"
+					onclick={() => nudge(1)}
+					disabled={spinning || freeLeft > 0 || bet === MAX_BET || (affordable !== null && bet >= affordable)}
+					aria-label="Raise bet">+</button
+				>
+			</div>
+
+			<div class="grid grid-cols-6 gap-1">
+				{#each BET_LEVELS as level}
 					<button
-						class="join-item btn btn-xs {lines === n ? 'btn-primary' : 'btn-ghost'} font-bold"
-						onclick={() => setLines(n)}
-						disabled={spinning || freeLeft > 0}
+						class="btn btn-xs {bet === level ? 'btn-primary' : 'btn-ghost'} font-bold tabular-nums"
+						onclick={() => setBet(level)}
+						disabled={spinning || freeLeft > 0 || level * lines > gold}
 					>
-						{n}
+						{level}
 					</button>
 				{/each}
 			</div>
 		</div>
 
-		<div class="flex items-center justify-between gap-2">
-			<span class="text-[0.65rem] uppercase tracking-widest text-base-content/40">Bet per line</span>
+		<!-- Controls -->
+		<div class="flex items-center gap-3 xl:flex-col xl:items-stretch">
+			<div class="flex-1 xl:flex-none rounded-xl bg-base-100/60 border border-white/5 px-4 py-2.5 xl:flex xl:items-baseline xl:justify-between xl:gap-2">
+				<div class="text-[0.65rem] uppercase tracking-widest text-base-content/40">Balance</div>
+				<div class="text-xl font-black tabular-nums text-accent">🪙 {formatGold(gold)}</div>
+			</div>
 			<button
-				class="btn btn-xs btn-outline btn-warning font-bold"
-				onclick={betMax}
-				disabled={spinning || freeLeft > 0 || affordable === null || bet === affordable}
+				class="btn btn-lg flex-1 xl:flex-none xl:h-16 font-black text-lg shadow-xl {freeLeft > 0
+					? 'btn-secondary shadow-secondary/30'
+					: 'btn-primary shadow-primary/30'}"
+				onclick={spin}
+				disabled={!canSpin}
 			>
-				MAX
+				{#if spinning}
+					<span class="loading loading-spinner"></span>
+				{:else if freeLeft > 0}
+					FREE SPIN
+				{:else if affordable === null}
+					Not enough gold
+				{:else}
+					SPIN · 🪙{formatGold(stake)}
+				{/if}
 			</button>
 		</div>
 
-		<div class="flex items-center gap-3">
-			<button
-				class="btn btn-circle btn-sm btn-ghost text-xl font-black"
-				onclick={() => nudge(-1)}
-				disabled={spinning || freeLeft > 0 || bet === MIN_BET}
-				aria-label="Lower bet">−</button
-			>
-			<div class="flex-1 text-center">
-				<div class="text-xl font-black tabular-nums text-accent leading-none">🪙 {formatGold(bet)}</div>
-				<div class="text-[0.65rem] text-base-content/45 mt-1">
-					× {lines} {lines === 1 ? 'line' : 'lines'} = 🪙{formatGold(stake)} a spin
+		{#if session.spins > 0}
+			<div class="grid grid-cols-4 xl:grid-cols-2 gap-2 text-center">
+				<div class="rounded-xl bg-base-100/50 p-2.5">
+					<div class="text-lg font-black tabular-nums">{session.spins}</div>
+					<div class="text-[0.65rem] text-base-content/45">Spins</div>
+				</div>
+				<div class="rounded-xl bg-base-100/50 p-2.5">
+					<div class="text-lg font-black tabular-nums text-cyan-300">🪙{formatGold(session.won)}</div>
+					<div class="text-[0.65rem] text-base-content/45">Won</div>
+				</div>
+				<div class="rounded-xl bg-base-100/50 p-2.5">
+					<div class="text-lg font-black tabular-nums text-fuchsia-300">{session.bonuses}</div>
+					<div class="text-[0.65rem] text-base-content/45">Bonuses</div>
+				</div>
+				<div class="rounded-xl bg-base-100/50 p-2.5">
+					<div class="text-lg font-black tabular-nums {sessionNet >= 0 ? 'text-success' : 'text-error'}">
+						{sessionNet >= 0 ? '+' : ''}{formatGold(sessionNet)}
+					</div>
+					<div class="text-[0.65rem] text-base-content/45">Net</div>
 				</div>
 			</div>
-			<button
-				class="btn btn-circle btn-sm btn-ghost text-xl font-black"
-				onclick={() => nudge(1)}
-				disabled={spinning || freeLeft > 0 || bet === MAX_BET || (affordable !== null && bet >= affordable)}
-				aria-label="Raise bet">+</button
-			>
-		</div>
+		{/if}
 
-		<div class="grid grid-cols-6 gap-1">
-			{#each BET_LEVELS as level}
-				<button
-					class="btn btn-xs {bet === level ? 'btn-primary' : 'btn-ghost'} font-bold tabular-nums"
-					onclick={() => setBet(level)}
-					disabled={spinning || freeLeft > 0 || level * lines > gold}
-				>
-					{level}
-				</button>
-			{/each}
-		</div>
-	</div>
+		<!-- Paytable -->
+		<div class="rounded-2xl bg-base-100/50 border border-white/5 p-4">
+			<div class="flex items-baseline justify-between mb-3">
+				<span class="text-xs uppercase tracking-widest text-base-content/40">Paytable</span>
+				<span class="text-[0.7rem] text-base-content/40">per line, at 🪙{formatGold(bet)}</span>
+			</div>
+			<div class="space-y-1.5">
+				{#each payRows as row}
+					{@const def = PAYTABLE[row.key]}
+					<div class="flex items-center gap-3">
+						<div class="flex gap-1 w-24 shrink-0">
+							{#each row.icons as id}
+								{@const s = SYMBOLS[id]}
+								<span
+									class="size-6 rounded-md grid place-items-center text-xs border border-black/20"
+									style="background:{s.color};color:{s.text}">{s.glyph}</span
+								>
+							{/each}
+						</div>
+						<div class="flex-1 text-sm text-base-content/70 truncate">{def.label}</div>
+						<div class="font-bold tabular-nums text-accent whitespace-nowrap">
+							🪙{formatGold(def.mult * bet)}
+						</div>
+					</div>
+				{/each}
 
-	<!-- Controls -->
-	<div class="flex items-center gap-3">
-		<div class="flex-1 rounded-xl bg-base-100/60 border border-white/5 px-4 py-2.5">
-			<div class="text-[0.65rem] uppercase tracking-widest text-base-content/40">Balance</div>
-			<div class="text-xl font-black tabular-nums text-accent">🪙 {formatGold(gold)}</div>
-		</div>
-		<button
-			class="btn btn-lg flex-1 font-black text-lg shadow-xl {freeLeft > 0
-				? 'btn-secondary shadow-secondary/30'
-				: 'btn-primary shadow-primary/30'}"
-			onclick={spin}
-			disabled={!canSpin}
-		>
-			{#if spinning}
-				<span class="loading loading-spinner"></span>
-			{:else if freeLeft > 0}
-				FREE SPIN
-			{:else if affordable === null}
-				Not enough gold
-			{:else}
-				SPIN · 🪙{formatGold(stake)}
-			{/if}
-		</button>
-	</div>
-
-	{#if session.spins > 0}
-		<div class="grid grid-cols-4 gap-2 text-center">
-			<div class="rounded-xl bg-base-100/50 p-2.5">
-				<div class="text-lg font-black tabular-nums">{session.spins}</div>
-				<div class="text-[0.65rem] text-base-content/45">Spins</div>
-			</div>
-			<div class="rounded-xl bg-base-100/50 p-2.5">
-				<div class="text-lg font-black tabular-nums text-cyan-300">🪙{formatGold(session.won)}</div>
-				<div class="text-[0.65rem] text-base-content/45">Won</div>
-			</div>
-			<div class="rounded-xl bg-base-100/50 p-2.5">
-				<div class="text-lg font-black tabular-nums text-fuchsia-300">{session.bonuses}</div>
-				<div class="text-[0.65rem] text-base-content/45">Bonuses</div>
-			</div>
-			<div class="rounded-xl bg-base-100/50 p-2.5">
-				<div class="text-lg font-black tabular-nums {sessionNet >= 0 ? 'text-success' : 'text-error'}">
-					{sessionNet >= 0 ? '+' : ''}{formatGold(sessionNet)}
-				</div>
-				<div class="text-[0.65rem] text-base-content/45">Net</div>
-			</div>
-		</div>
-	{/if}
-
-	<!-- Paytable -->
-	<div class="rounded-2xl bg-base-100/50 border border-white/5 p-4">
-		<div class="flex items-baseline justify-between mb-3">
-			<span class="text-xs uppercase tracking-widest text-base-content/40">Paytable</span>
-			<span class="text-[0.7rem] text-base-content/40">per line, at 🪙{formatGold(bet)}</span>
-		</div>
-		<div class="space-y-1.5">
-			{#each payRows as row}
-				{@const def = PAYTABLE[row.key]}
-				<div class="flex items-center gap-3">
+				<div class="flex items-center gap-3 pt-1.5 mt-1.5 border-t border-white/5">
 					<div class="flex gap-1 w-24 shrink-0">
-						{#each row.icons as id}
-							{@const s = SYMBOLS[id]}
+						{#each Array(SCATTER.need) as _}
 							<span
 								class="size-6 rounded-md grid place-items-center text-xs border border-black/20"
-								style="background:{s.color};color:{s.text}">{s.glyph}</span
+								style="background:{SYMBOLS.scatter.color};color:{SYMBOLS.scatter.text}"
+								>{SYMBOLS.scatter.glyph}</span
 							>
 						{/each}
 					</div>
-					<div class="flex-1 text-sm text-base-content/70 truncate">{def.label}</div>
+					<div class="flex-1 text-sm text-fuchsia-300 truncate">
+						Anywhere → {SCATTER.freeSpins} free spins
+					</div>
 					<div class="font-bold tabular-nums text-accent whitespace-nowrap">
-						🪙{formatGold(def.mult * bet)}
+						🪙{formatGold(SCATTER.payMult * stake)}
 					</div>
 				</div>
-			{/each}
-
-			<div class="flex items-center gap-3 pt-1.5 mt-1.5 border-t border-white/5">
-				<div class="flex gap-1 w-24 shrink-0">
-					{#each Array(SCATTER.need) as _}
-						<span
-							class="size-6 rounded-md grid place-items-center text-xs border border-black/20"
-							style="background:{SYMBOLS.scatter.color};color:{SYMBOLS.scatter.text}"
-							>{SYMBOLS.scatter.glyph}</span
-						>
-					{/each}
-				</div>
-				<div class="flex-1 text-sm text-fuchsia-300 truncate">
-					Anywhere → {SCATTER.freeSpins} free spins
-				</div>
-				<div class="font-bold tabular-nums text-accent whitespace-nowrap">
-					🪙{formatGold(SCATTER.payMult * stake)}
-				</div>
 			</div>
+
+			<p class="text-[0.7rem] text-base-content/40 mt-3 leading-relaxed">
+				<span class="inline-grid place-items-center size-4 rounded align-text-bottom" style="background:{SYMBOLS.wild.color};color:{SYMBOLS.wild.text}">{SYMBOLS.wild.glyph}</span>
+				is wild on any line but never substitutes for
+				<span class="inline-grid place-items-center size-4 rounded align-text-bottom" style="background:{SYMBOLS.scatter.color};color:{SYMBOLS.scatter.text}">{SYMBOLS.scatter.glyph}</span>,
+				which pays from anywhere on the grid and on the total bet. One win per line, best only.
+				Payouts are multipliers of your stake, so the return is identical at every bet and line
+				count — more lines buy more coverage, not better value. Reels are rolled on the server with
+				a cryptographic RNG, which also validates the stake.
+			</p>
 		</div>
 
-		<p class="text-[0.7rem] text-base-content/40 mt-3 leading-relaxed">
-			<span class="inline-grid place-items-center size-4 rounded align-text-bottom" style="background:{SYMBOLS.wild.color};color:{SYMBOLS.wild.text}">{SYMBOLS.wild.glyph}</span>
-			is wild on any line but never substitutes for
-			<span class="inline-grid place-items-center size-4 rounded align-text-bottom" style="background:{SYMBOLS.scatter.color};color:{SYMBOLS.scatter.text}">{SYMBOLS.scatter.glyph}</span>,
-			which pays from anywhere on the grid and on the total bet. One win per line, best only.
-			Payouts are multipliers of your stake, so the return is identical at every bet and line
-			count — more lines buy more coverage, not better value. Reels are rolled on the server with
-			a cryptographic RNG, which also validates the stake.
-		</p>
+		{#if data.slots?.spins > 0}
+			<div class="rounded-2xl bg-base-100/50 border border-white/5 p-4">
+				<div class="text-xs uppercase tracking-widest text-base-content/40 mb-3">All time</div>
+				<div class="grid grid-cols-4 xl:grid-cols-2 gap-3 text-center">
+					<div>
+						<div class="text-lg font-black tabular-nums">{formatGold(data.slots.spins)}</div>
+						<div class="text-[0.65rem] text-base-content/45">Spins</div>
+					</div>
+					<div>
+						<div class="text-lg font-black tabular-nums text-fuchsia-300">{formatGold(data.slots.bonuses)}</div>
+						<div class="text-[0.65rem] text-base-content/45">Bonuses</div>
+					</div>
+					<div>
+						<div class="text-lg font-black tabular-nums {data.slots.net >= 0 ? 'text-success' : 'text-error'}">
+							{data.slots.net >= 0 ? '+' : ''}{formatGold(data.slots.net)}
+						</div>
+						<div class="text-[0.65rem] text-base-content/45">Net gold</div>
+					</div>
+					<div>
+						<div class="text-lg font-black tabular-nums">
+							{data.slots.returnPct != null ? (data.slots.returnPct * 100).toFixed(0) + '%' : '—'}
+						</div>
+						<div class="text-[0.65rem] text-base-content/45">Your return</div>
+					</div>
+				</div>
+			</div>
+		{/if}
 	</div>
-
-	{#if data.slots?.spins > 0}
-		<div class="rounded-2xl bg-base-100/50 border border-white/5 p-4">
-			<div class="text-xs uppercase tracking-widest text-base-content/40 mb-3">All time</div>
-			<div class="grid grid-cols-4 gap-3 text-center">
-				<div>
-					<div class="text-lg font-black tabular-nums">{formatGold(data.slots.spins)}</div>
-					<div class="text-[0.65rem] text-base-content/45">Spins</div>
-				</div>
-				<div>
-					<div class="text-lg font-black tabular-nums text-fuchsia-300">{formatGold(data.slots.bonuses)}</div>
-					<div class="text-[0.65rem] text-base-content/45">Bonuses</div>
-				</div>
-				<div>
-					<div class="text-lg font-black tabular-nums {data.slots.net >= 0 ? 'text-success' : 'text-error'}">
-						{data.slots.net >= 0 ? '+' : ''}{formatGold(data.slots.net)}
-					</div>
-					<div class="text-[0.65rem] text-base-content/45">Net gold</div>
-				</div>
-				<div>
-					<div class="text-lg font-black tabular-nums">
-						{data.slots.returnPct != null ? (data.slots.returnPct * 100).toFixed(0) + '%' : '—'}
-					</div>
-					<div class="text-[0.65rem] text-base-content/45">Your return</div>
-				</div>
-			</div>
-		</div>
-	{/if}
 </div>

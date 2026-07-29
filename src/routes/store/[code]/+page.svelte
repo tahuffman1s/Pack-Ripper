@@ -69,10 +69,10 @@
 
 <div class="flex items-center gap-3 mb-5">
 	{#if data.icon}
-		<img src={data.icon} alt="" class="size-11 opacity-90" style="filter: invert(1)" />
+		<img src={data.icon} alt="" class="size-11 lg:size-14 opacity-90" style="filter: invert(1)" />
 	{/if}
 	<div>
-		<h1 class="text-2xl font-black leading-tight">{data.set.name}</h1>
+		<h1 class="text-2xl lg:text-4xl font-black leading-tight">{data.set.name}</h1>
 		<p class="text-sm text-base-content/55">{data.set.tag} · {data.set.year} · {data.set.cardCount} cards · <span class="uppercase">{data.set.code}</span></p>
 	</div>
 </div>
@@ -93,7 +93,8 @@
 	</div>
 {/if}
 
-<div class="flex flex-col gap-4">
+<!-- One product per row on a phone; two or three abreast where there is room. -->
+<div class="flex flex-col gap-4 lg:grid lg:grid-cols-2 2xl:grid-cols-3 lg:gap-5 lg:items-start">
 	{#each groups as g (g.packTypeId)}
 		{@const ac = accentClasses[g.meta.accent] || accentClasses.primary}
 		<div class="card bg-base-100/70 border border-white/5 shadow-lg overflow-hidden">
