@@ -14,7 +14,7 @@
  */
 
 import { timingSafeEqual } from 'node:crypto';
-import { getDb, mutate, makeId } from './db.js';
+import { getDb, mutate, makeId, dbStatus } from './db.js';
 import {
 	isAdminUser,
 	envAdminNames,
@@ -138,7 +138,11 @@ export function summary() {
 		tablesOpen: Object.keys(db.blackjack || {}).length,
 		uptimeSeconds: Math.round(process.uptime()),
 		nodeVersion: process.version,
-		tokenAuth: tokenAuthEnabled()
+		tokenAuth: tokenAuthEnabled(),
+		// Where the accounts came from on this boot. `startedEmpty` on a deployment
+		// that should have data means the volume is not mounted, and is worth seeing
+		// before someone registers and starts filling a database that will vanish.
+		storage: dbStatus()
 	};
 }
 

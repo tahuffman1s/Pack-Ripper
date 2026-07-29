@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	writeFileSync,
+	renameSync,
+	unlinkSync,
+	copyFileSync,
+	statSync
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /**
@@ -8,10 +17,34 @@ import { dirname, join } from 'node:path';
  * runs anywhere Node runs. Everything is kept in memory and flushed to disk
  * atomically (write temp + rename) on every mutation. Fine for a single-process
  * simulator; not meant for high concurrency.
+ *
+ * The rest of this file is mostly about not destroying that one file. It holds
+ * every account, so the worst thing it can do is not "lose a write" — it is
+ * "write an empty database over a full one", and there were three ways to get
+ * there. Each is now blocked, and none of them relied on noticing in time:
+ *
+ *  1. A missing db.json used to be created immediately, empty. On Azure .data is
+ *     an SMB mount, and a mount that is not attached yet looks exactly like a
+ *     first-ever boot — so the app wrote an empty database onto the share and the
+ *     real one was gone. Nothing is written now until a real mutation happens.
+ *  2. An unreadable db.json used to be replaced by an empty one, which also
+ *     destroyed the evidence. It is now moved aside, kept, and recovered from.
+ *  3. The SMB fallback below writes in place, non-atomically. A container killed
+ *     mid-write — which is what a new revision does to the old one — left a torn
+ *     file, and the next boot hit path 2. There is now a complete second copy to
+ *     fall back on, and the torn file is never mistaken for the truth.
  */
 
 const DATA_DIR = join(process.cwd(), '.data');
 const DB_PATH = join(DATA_DIR, 'db.json');
+const BAK_PATH = DB_PATH + '.bak';
+const TMP_PATH = DB_PATH + '.tmp';
+
+/** Escape hatch: set to deliberately start over on a share that has data. */
+const ALLOW_RESET = process.env.ALLOW_DB_RESET === '1';
+
+/** How often to refresh the backup copy. Every flush would double SMB writes. */
+const BACKUP_EVERY_MS = 1000 * 60 * 5;
 
 const DEFAULT_DB = {
 	users: {}, // id -> { id, username, passwordHash, salt, createdAt, admin? }
@@ -30,46 +63,199 @@ const DEFAULT_DB = {
 
 let db = null;
 let flushTimer = null;
+let lastBackupAt = 0;
+
+/** What happened at load, for the startup log and the admin panel. */
+let status = { loadedFrom: null, users: 0, startedEmpty: false, recovered: null, refusals: 0 };
+
+const userCount = (o) => Object.keys(o?.users || {}).length;
+
+/** Parse one candidate file. Returns null if it is absent or not usable. */
+function readSnapshot(path) {
+	if (!existsSync(path)) return null;
+	try {
+		const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+		// A JSON file that parses but has no users map is not a database — most
+		// likely a half-written one that happened to land on valid syntax.
+		if (!parsed || typeof parsed !== 'object' || !parsed.users) return null;
+		return parsed;
+	} catch (e) {
+		console.error(`db: ${path} is unreadable — ${e.message}`);
+		return null;
+	}
+}
+
+/** Keep a bad file instead of overwriting it. Nothing here is worth losing twice. */
+function setAside(path) {
+	if (!existsSync(path)) return null;
+	const kept = `${path}.corrupt-${Date.now()}`;
+	try {
+		renameSync(path, kept);
+		return kept;
+	} catch {
+		try {
+			copyFileSync(path, kept);
+			return kept;
+		} catch {
+			return null;
+		}
+	}
+}
 
 function ensureLoaded() {
 	if (db) return db;
 	if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-	if (existsSync(DB_PATH)) {
-		try {
-			const raw = readFileSync(DB_PATH, 'utf-8');
-			db = { ...structuredClone(DEFAULT_DB), ...JSON.parse(raw) };
-		} catch (e) {
-			console.error('Failed to read db.json, starting fresh:', e);
-			db = structuredClone(DEFAULT_DB);
-		}
+
+	// In preference order. db.json.tmp is a real candidate, not debris: it is
+	// written in full before the rename, so if the rename never happened it is the
+	// newest complete copy that exists.
+	const primary = readSnapshot(DB_PATH);
+	if (primary) {
+		db = { ...structuredClone(DEFAULT_DB), ...primary };
+		status = { ...status, loadedFrom: DB_PATH, users: userCount(db), startedEmpty: false };
 	} else {
-		db = structuredClone(DEFAULT_DB);
-		flushNow();
+		const kept = existsSync(DB_PATH) ? setAside(DB_PATH) : null;
+		const fallback =
+			[
+				[BAK_PATH, readSnapshot(BAK_PATH)],
+				[TMP_PATH, readSnapshot(TMP_PATH)]
+			].find(([, v]) => v) || null;
+
+		if (fallback) {
+			db = { ...structuredClone(DEFAULT_DB), ...fallback[1] };
+			status = {
+				...status,
+				loadedFrom: fallback[0],
+				users: userCount(db),
+				startedEmpty: false,
+				recovered: kept
+			};
+			console.error(
+				`db: RECOVERED ${status.users} account(s) from ${fallback[0]}.` +
+					(kept ? ` The unusable file was kept at ${kept}.` : '')
+			);
+		} else {
+			// Nothing readable anywhere. Start empty IN MEMORY ONLY — see note 1 at
+			// the top. A not-yet-attached mount is indistinguishable from a first
+			// boot, and only one of those two should ever write.
+			db = structuredClone(DEFAULT_DB);
+			status = { ...status, loadedFrom: null, users: 0, startedEmpty: true, recovered: kept };
+			console.error(
+				`db: no usable database at ${DB_PATH} — starting empty. ` +
+					'Nothing will be written until something actually changes. If this is a ' +
+					'restart rather than a first run, the volume is probably not mounted.'
+			);
+		}
+	}
+
+	if (status.loadedFrom) {
+		console.log(`db: loaded ${status.users} account(s) from ${status.loadedFrom}`);
 	}
 	return db;
+}
+
+/**
+ * Refuse to overwrite accounts this process has never seen.
+ *
+ * Only a process that failed to load a database can be about to do this; once we
+ * have read one, our copy is the authority and this never fires. The test is
+ * per-account rather than "is memory empty", because the sequence that actually
+ * loses data is: boot with the volume unattached, the share appears, someone
+ * registers — and by then memory holds one account, which an emptiness check
+ * reads as a legitimate database worth saving. It is not. It is missing 71 others.
+ *
+ * Set ALLOW_DB_RESET=1 to start over deliberately.
+ */
+let diskSig = null;
+let diskVerdict = false;
+
+function wouldDestroyData() {
+	if (ALLOW_RESET) return false;
+	if (!status.startedEmpty) return false;
+
+	// One stat per flush instead of a read-and-parse, since this runs for the life
+	// of a process that started empty and the answer only changes when the file does.
+	let sig = 'none';
+	try {
+		const s = statSync(DB_PATH);
+		sig = `${s.size}:${s.mtimeMs}`;
+	} catch {
+		sig = 'none';
+	}
+	if (sig === diskSig) return diskVerdict;
+	diskSig = sig;
+
+	const onDisk = readSnapshot(DB_PATH) || readSnapshot(BAK_PATH);
+	if (!onDisk) {
+		diskVerdict = false;
+		return false;
+	}
+	const mine = new Set(Object.keys(db.users || {}));
+	diskVerdict = Object.keys(onDisk.users || {}).some((id) => !mine.has(id));
+	return diskVerdict;
+}
+
+/** Second complete copy, refreshed on a timer rather than on every write. */
+function refreshBackup(now) {
+	if (now - lastBackupAt < BACKUP_EVERY_MS) return;
+	if (!existsSync(DB_PATH)) return;
+	try {
+		// Only from a file that currently parses — a backup of a torn file is worse
+		// than no backup, because it is the thing recovery trusts.
+		if (!readSnapshot(DB_PATH)) return;
+		copyFileSync(DB_PATH, BAK_PATH);
+		lastBackupAt = now;
+	} catch (e) {
+		console.error('db: backup copy failed:', e.message);
+	}
 }
 
 function flushNow() {
 	if (!db) return;
 	if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-	const tmp = DB_PATH + '.tmp';
+
+	if (wouldDestroyData()) {
+		status.refusals++;
+		console.error(
+			'db: REFUSING to save — the file on disk holds accounts this process never ' +
+				'loaded, so writing would erase them. The volume was almost certainly not ' +
+				'mounted at startup. Restart with it attached (anything created since this ' +
+				'process started will be lost, which is the smaller loss). Set ALLOW_DB_RESET=1 ' +
+				'only if you mean to erase what is there.'
+		);
+		return;
+	}
+
+	const now = Date.now();
+	refreshBackup(now);
+
 	const json = JSON.stringify(db, null, '\t');
-	writeFileSync(tmp, json);
+	writeFileSync(TMP_PATH, json);
 	try {
-		renameSync(tmp, DB_PATH);
+		renameSync(TMP_PATH, DB_PATH);
+		return;
 	} catch (e) {
-		// In Azure, .data is an Azure Files (SMB) mount, where a rename over an
-		// existing file can fail even though a plain write to the same path
-		// succeeds. Give up atomicity rather than the write: a torn db.json is a
-		// bad afternoon, a flush that silently never lands loses every account
-		// created since the last one that did.
-		console.error('Atomic rename failed, writing in place:', e);
+		console.error('db: atomic rename failed:', e.message);
+	}
+
+	// Azure Files (SMB) can refuse a rename ONTO an existing file while allowing a
+	// rename to a free name. Clearing the target first keeps the write atomic,
+	// which the in-place path below does not.
+	try {
+		unlinkSync(DB_PATH);
+		renameSync(TMP_PATH, DB_PATH);
+		return;
+	} catch (e) {
+		console.error('db: unlink-then-rename failed:', e.message);
+	}
+
+	// Last resort. Truncates and rewrites in place, so a process killed here leaves
+	// a torn file — which is why db.json.tmp is deliberately left behind as a
+	// complete copy for the next boot to recover from.
+	try {
 		writeFileSync(DB_PATH, json);
-		try {
-			unlinkSync(tmp);
-		} catch {
-			// Nothing to clean up, or the mount will not let us. Either is fine.
-		}
+	} catch (e) {
+		console.error('db: in-place write failed, database NOT saved:', e.message);
 	}
 }
 
@@ -84,6 +270,70 @@ export function persist() {
 			console.error('DB flush failed:', e);
 		}
 	}, 60);
+}
+
+/**
+ * Flush right now, skipping the debounce. Called when the process is going away:
+ * a new Azure revision stops the old container, and a pending 60ms timer does not
+ * survive that.
+ */
+export function flushSync() {
+	if (flushTimer) {
+		clearTimeout(flushTimer);
+		flushTimer = null;
+	}
+	try {
+		flushNow();
+	} catch (e) {
+		console.error('DB final flush failed:', e);
+	}
+}
+
+let hooked = false;
+/**
+ * Persist on shutdown. Idempotent, so importing this twice is harmless.
+ *
+ * Deliberately does NOT exit: adapter-node registers its own SIGTERM handler that
+ * drains in-flight requests before exiting, and Node runs every listener for a
+ * signal. Flushing here and returning lets that drain happen; calling
+ * process.exit() would cut it short and drop whatever was still being served.
+ *
+ * `exit` is the backstop, because it fires on an explicit process.exit() — which
+ * is how adapter-node finishes — where `beforeExit` does not.
+ */
+export function installShutdownFlush() {
+	if (hooked) return;
+	hooked = true;
+	for (const sig of ['SIGTERM', 'SIGINT']) {
+		process.on(sig, () => {
+			console.log(`db: ${sig} — flushing`);
+			flushSync();
+		});
+	}
+	process.on('exit', flushSync);
+	process.on('beforeExit', flushSync);
+}
+
+/** Where the data came from and whether anything looked wrong. For /admin. */
+export function dbStatus() {
+	ensureLoaded();
+	let bytes = null;
+	try {
+		bytes = statSync(DB_PATH).size;
+	} catch {
+		bytes = null;
+	}
+	return {
+		path: DB_PATH,
+		loadedFrom: status.loadedFrom,
+		startedEmpty: status.startedEmpty,
+		recoveredFrom: status.recovered,
+		refusedWrites: status.refusals,
+		usersAtLoad: status.users,
+		bytes,
+		hasBackup: existsSync(BAK_PATH),
+		allowReset: ALLOW_RESET
+	};
 }
 
 export function getDb() {

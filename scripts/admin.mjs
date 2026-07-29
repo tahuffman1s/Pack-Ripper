@@ -348,6 +348,34 @@ async function cmdStatus() {
 	console.log(`  gold          ${num(summary.gold)} in circulation`);
 	console.log(`  cards         ${num(summary.cards)} owned, ${num(summary.serialsIssued)} serials issued`);
 	console.log(`  packs         ${num(summary.packs)} unopened, ${num(summary.tablesOpen)} table(s) in play`);
+
+	// The line that matters after a deploy: a volume that is not mounted looks
+	// exactly like a first boot to the app, and only it knows which it decided.
+	const st = summary.storage;
+	if (st) {
+		const state = st.startedEmpty
+			? `${c.r}STARTED EMPTY${c.n}`
+			: st.recoveredFrom
+				? `${c.y}recovered${c.n}`
+				: `${c.g}loaded${c.n}`;
+		console.log(`  database      ${state}  ${st.path}`);
+		console.log(
+			`                ${num(st.usersAtLoad)} account(s) at load` +
+				(st.bytes != null ? `, ${Math.round(st.bytes / 1024)} KB` : '') +
+				`, backup ${st.hasBackup ? 'present' : 'not yet written'}`
+		);
+		if (st.startedEmpty) {
+			console.log(
+				`  ${c.y}!${c.n}             no database was found. If this deployment had accounts, the`
+			);
+			console.log('                volume is not mounted — nothing has been overwritten yet.');
+		}
+		if (st.recoveredFrom) console.log(`  ${c.y}!${c.n}             bad file kept at ${st.recoveredFrom}`);
+		if (st.refusedWrites) {
+			console.log(`  ${c.r}!${c.n}             ${st.refusedWrites} write(s) refused to protect existing accounts`);
+		}
+		if (st.allowReset) console.log(`  ${c.y}!${c.n}             ALLOW_DB_RESET=1 is set`);
+	}
 	if (summary.envAdmins.length) console.log(`  ADMIN_USERNAMES  ${summary.envAdmins.join(', ')}`);
 	if (log?.length) {
 		console.log(`  last action   ${log[0].action} ${log[0].target || ''} by ${log[0].actor} at ${when(log[0].at)}`);

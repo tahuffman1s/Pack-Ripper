@@ -357,7 +357,9 @@ Four things the create form will not prompt for, each of which breaks something 
   first of those, the hosted copy has no admins and no way to appoint one.
 - **A volume mounted at `/app/.data`** (Azure Files). That is the entire database — accounts,
   collections, wallets, the serial-number ledger. Without it, every revision and every restart
-  starts empty.
+  starts empty. **Adding it to one revision does not add it to the next**: the mount lives in the
+  revision template, so a revision created from a template that lacks it comes up with no volume
+  and no warning. Check it after every deploy — see below.
 - **Do not mount `.cache`.** It is ~100 MB of regenerated Scryfall, MTGJSON and TCGplayer data
   with its own TTLs, read as thousands of small files, which is what SMB is worst at. Left on
   local disk it costs a slow first minute after a deploy and is fast for every request after.
@@ -372,6 +374,32 @@ the platform decide the container is broken and restart it in a loop.
 
 At 0.5 vCPU / 1 GiB always on, expect roughly $10–15 a month against your credits. Container
 Apps bills per second, so deleting the resource group genuinely stops the meter.
+
+### Checking that the database is actually mounted
+
+The single most expensive mistake here is a revision that comes up without its volume, because
+the app cannot tell that from a first-ever boot. It says which it thinks it is, on the first line
+of the log:
+
+```
+db: loaded 71 account(s) from /app/.data/db.json        ← mounted, data found
+db: no usable database at /app/.data/db.json — ...      ← nothing there
+```
+
+The second line on a deployment that should have accounts means **the volume is not mounted**.
+Nothing has been overwritten at that point — the app writes nothing at startup, and refuses to
+save over accounts it never loaded — so fixing the mount and restarting gets everything back.
+Anything created while it was in that state is lost, which is the smaller loss.
+
+The same thing is on the admin panel as a **Storage** card, which turns red in that state, and
+`./admin.sh status --url https://<hostname>` reports it without needing log access. Worth a look
+after every revision.
+
+If the file is ever damaged — a container killed mid-write on SMB can truncate it — the app
+recovers from `db.json.bak` or an orphaned `db.json.tmp` (a complete copy, written before the
+rename that never happened) and keeps the bad file as `db.json.corrupt-<timestamp>` rather than
+overwriting it. `ALLOW_DB_RESET=1` is the deliberate "yes, erase it" switch; without it the app
+would rather serve nothing than destroy accounts.
 
 ### Shipping a new build
 

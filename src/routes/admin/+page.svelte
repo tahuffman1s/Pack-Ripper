@@ -234,6 +234,59 @@
 	</div>
 </div>
 
+<!-- ── storage ─────────────────────────────────────────────────
+     The whole database is one file. Whether it was found on this boot is the
+     difference between a mounted volume and one that quietly is not, so it is
+     stated rather than left to be discovered after a wipe. -->
+{#if data.summary.storage}
+	{@const st = data.summary.storage}
+	<div
+		class="card mb-4 border {st.startedEmpty || st.refusedWrites || st.recoveredFrom
+			? 'border-error/40 bg-error/5'
+			: 'border-white/5 bg-base-100/40'}"
+	>
+		<div class="card-body p-3 gap-1 text-xs">
+			<div class="flex items-center gap-2 font-bold text-sm">
+				<span>💾 Storage</span>
+				{#if st.startedEmpty}
+					<span class="badge badge-sm badge-error font-bold">started empty</span>
+				{:else if st.recoveredFrom}
+					<span class="badge badge-sm badge-warning font-bold">recovered</span>
+				{:else}
+					<span class="badge badge-sm badge-success font-bold">loaded</span>
+				{/if}
+			</div>
+			<div class="text-base-content/60 flex flex-wrap gap-x-5 gap-y-1">
+				<span><span class="font-mono">{st.path}</span></span>
+				{#if st.bytes != null}<span>{(st.bytes / 1024).toFixed(0)} KB</span>{/if}
+				<span>{formatGold(st.usersAtLoad)} account(s) at load</span>
+				<span>backup: {st.hasBackup ? 'yes' : 'not yet'}</span>
+				{#if st.allowReset}<span class="text-warning font-mono">ALLOW_DB_RESET=1</span>{/if}
+			</div>
+			{#if st.startedEmpty}
+				<p class="text-error mt-1">
+					No database was found at that path on this boot. On a deployment that already had
+					accounts, that means the volume is <strong>not mounted</strong> — mount Azure Files at
+					<span class="font-mono">/app/.data</span> and restart. Nothing has been written yet, so
+					the existing data is still intact; it will stay that way until someone changes something.
+				</p>
+			{/if}
+			{#if st.recoveredFrom}
+				<p class="text-warning mt-1">
+					The main file was unusable and the data came from a backup. The bad file was kept at
+					<span class="font-mono">{st.recoveredFrom}</span>.
+				</p>
+			{/if}
+			{#if st.refusedWrites}
+				<p class="text-error mt-1">
+					Refused {st.refusedWrites} write(s) that would have erased accounts this process never
+					loaded. Nothing is being saved right now — fix the mount and restart.
+				</p>
+			{/if}
+		</div>
+	</div>
+{/if}
+
 <!-- ── accounts ────────────────────────────────────────────── -->
 <div class="flex items-center justify-between gap-3 mb-2">
 	<h2 class="font-bold text-sm uppercase tracking-wide text-base-content/60">
