@@ -1,0 +1,78 @@
+# Build the runtime image and push it to this repo's GitHub Container Registry,
+# so `./run.sh pull` can fetch it instead of building locally:
+#
+#   ghcr.io/tahuffman1s/pack-ripper:latest
+#
+# GHCR needs no secrets — the automatic GITHUB_TOKEN can write packages as long
+# as the job asks for the permission below. One manual step after the first run:
+# the new package starts private, so open
+# github.com/users/<you>/packages/container/pack-ripper/settings and set the
+# visibility to public if you want `podman pull` to work without a login.
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    # The image contains none of these, so a doc edit or a redirector tweak
+    # should not spend five minutes rebuilding it.
+    paths-ignore:
+      - 'pages/**'
+      - 'README.md'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR rejects an uppercase path, and this repo is Pack-Ripper —
+      # metadata-action lowercases `images` for us, which is the whole reason to
+      # route the name through it rather than interpolating it inline.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # amd64 only. Adding linux/arm64 works but runs `npm ci` and the vite
+          # build under QEMU emulation, which takes it from ~3 minutes to ~20.
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo '### Pushed'
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

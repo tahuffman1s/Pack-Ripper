@@ -167,6 +167,147 @@ npm run build
 npm run start    # serves the node adapter build on PORT (default 3000)
 ```
 
+## Running in a container
+
+`run.sh` builds the image and starts two containers — the app, and a Cloudflare tunnel that
+puts it on the public internet. It drives `podman` or `docker` directly rather than compose,
+so it needs no compose provider installed.
+
+```bash
+./run.sh               # app + Cloudflare tunnel, prints the public URL
+./run.sh local         # app only, on http://localhost:3000
+./run.sh down          # stop and remove both containers
+./run.sh logs tunnel   # follow either container's logs
+./run.sh restart       # keeps .data and .cache
+./run.sh url           # print the current public URL again
+./run.sh pull          # run the image GitHub Actions built, instead of building
+```
+
+With no configuration you get a **quick tunnel**: cloudflared prints a random
+`https://<words>.trycloudflare.com` URL, no Cloudflare account required, and it disappears
+when the tunnel stops. For a **stable hostname**, copy `.env.example` to `.env`, create a
+tunnel in the Cloudflare dashboard (Zero Trust → Networks → Tunnels), point its public
+hostname at `http://packripper:3000`, and paste the connector token into
+`CLOUDFLARE_TUNNEL_TOKEN`.
+
+Two details worth knowing:
+
+- **`.data` and `.cache` are bind-mounted**, so accounts survive a rebuild and the image
+  never contains a database. Neither directory is in the image — `.data` holds real password
+  hashes and live session tokens, and baking those into a layer would ship them wherever the
+  image goes. Under rootless podman the container writes them as your own user.
+- **The request origin has to be right.** SvelteKit refuses any POST whose `Origin` header
+  disagrees with the origin it believes it is serving, and a mismatch breaks every login and
+  purchase while pages keep loading normally. `run.sh local` pins `ORIGIN` to
+  `http://localhost:PORT`; behind a tunnel the app reads `x-forwarded-proto` /
+  `x-forwarded-host` instead, which is what makes an unpredictable quick-tunnel hostname work
+  with no configuration. Set `PUBLIC_URL` for a named tunnel to pin it explicitly.
+
+The runtime image is ~174 MB and contains no `node_modules` at all: adapter-node bundles the
+whole server into `build/`, whose only imports are `node:` builtins.
+
+Both containers run with `--restart unless-stopped`, which brings them back if they crash. To
+have them come back after a *reboot* under rootless podman you also need the shipped restart
+unit, which podman does not enable for you:
+
+```bash
+systemctl --user enable --now podman-restart.service
+loginctl enable-linger "$USER"    # so it starts without you logging in
+```
+
+`docker-compose.yml` is also provided for anyone who has a compose provider —
+`--profile quick` for a quick tunnel, `--profile tunnel` for a named one.
+
+## The image, on GHCR
+
+`.github/workflows/publish-image.yml` builds the runtime image on every push to `main` and
+pushes it to this repo's container registry:
+
+```bash
+podman pull ghcr.io/tahuffman1s/pack-ripper:latest     # or ./run.sh pull
+```
+
+Tags are `latest` (main), `sha-<short>` for every commit, and `v*` for tags. No secrets
+involved — the workflow's automatic `GITHUB_TOKEN` can write packages. Two things to know:
+
+- **The package starts private.** After the first successful run, open the package's settings
+  under your profile → Packages → `pack-ripper` → Danger Zone and set the visibility to
+  public if you want `podman pull` to work without a login. Otherwise
+  `podman login ghcr.io -u <you> --password-stdin` with a token that has `read:packages`.
+- **`linux/amd64` only.** Adding `linux/arm64` to `platforms:` works, but `npm ci` and the
+  vite build then run under QEMU and the job goes from ~3 minutes to ~20.
+
+Set `IMAGE=ghcr.io/tahuffman1s/pack-ripper:latest` in `.env` and `run.sh` uses the published
+image everywhere, pulling it instead of building when it is missing.
+
+## One link that never changes
+
+A quick tunnel mints a fresh `https://<words>.trycloudflare.com` hostname every time it
+starts, so any link you hand out dies at the next restart. The fix is a page on GitHub Pages
+that looks up the current hostname and forwards to it:
+
+**<https://tahuffman1s.github.io/Pack-Ripper/>** — this is the link you share. It never
+changes.
+
+How the pieces fit:
+
+```
+run.sh                       pages branch                github.io page
+  tunnel URL changes  ──PUT──▶  status.json  ──read──▶  probe /api/health ──▶ redirect
+  ./run.sh down       ──PUT──▶  up: false                     │
+                                                              └── dead? show "offline",
+                                                                  poll, redirect when back
+```
+
+- **`run.sh` publishes the URL** with a single GitHub Contents-API `PUT` to `status.json` on
+  the `pages` branch — no clone, no Actions run. It does this on `up`, on `down` (writing
+  `up: false`, so nobody is sent to a hostname that has stopped existing), and on demand with
+  `./run.sh publish`.
+- **`./run.sh up --watch`** leaves a watcher running that republishes when the answer changes.
+  This is what covers cloudflared restarting on its own — a new random hostname that nothing
+  else would notice. It writes only on change, so an idle watcher makes no commits.
+- **The page never trusts the file on its own.** It fetches `status.json` from two places and
+  takes the fresher one — the copy served by Pages, and the copy read straight off the branch
+  through `raw.githubusercontent.com`, which is current the instant `run.sh` writes it — then
+  requires `/api/health` to answer before it navigates. That endpoint sends
+  `access-control-allow-origin: *` purely so this check can tell "PackRipper is there" apart
+  from "the hostname is gone"; without the header a cross-origin fetch reports both as the
+  same network error.
+- **When nothing answers**, the page says offline, tells you when the server was last seen,
+  and keeps checking. Leave the tab open and it walks itself over to the new tunnel when one
+  appears. The path survives too: `/Pack-Ripper/packs` lands on `<tunnel>/packs`.
+
+### Turning it on
+
+1. Push to `main`. The `pages` workflow creates the `pages` branch from `pages/` and tries to
+   switch Pages on for you. If it could not, set it once by hand: **Settings → Pages → Deploy
+   from a branch → `pages` / `(root)`**.
+2. Create a [fine-grained token](https://github.com/settings/personal-access-tokens/new)
+   scoped to **this repository only**, with **Contents: Read and write** and nothing else.
+   Put it in `.env` as `GITHUB_TOKEN`.
+3. `./run.sh restart --build` once, so the running container has `/api/health`. Both the
+   readiness wait and the redirector's probe use it, and an image built before it existed will
+   never come up healthy.
+4. `./run.sh up --watch`, and hand out the github.io link.
+
+Leave `GITHUB_TOKEN` empty and none of this happens — `run.sh` prints the tunnel URL, says it
+did not publish, and behaves exactly as it did before.
+
+Worth knowing:
+
+- The Pages copy of `status.json` trails the branch by one Pages deploy, usually well under a
+  minute. The `raw.githubusercontent.com` read is immediate, which is why both are consulted;
+  each is fetched with a cache-buster and the newer timestamp wins.
+- The redirect only helps people who arrive *via* the github.io link. Someone already inside
+  the app when the tunnel dies is on the old `trycloudflare.com` host and will just see it
+  fail — they have to go back to the permanent link.
+- If the whole machine goes down, nothing gets to publish `up: false`. The page still shows
+  offline, because the health probe fails; it just reports a stale "last seen".
+- Add `?stay` to the link (`…github.io/Pack-Ripper/?stay`) to see what it resolved without
+  being redirected.
+- With a **named** tunnel the hostname is stable and lives in the Cloudflare dashboard, so
+  `run.sh` cannot discover it — set `PUBLIC_URL` in `.env` and it publishes that instead.
+
 ## Project layout
 
 ```
@@ -185,6 +326,7 @@ src/
       PlayingCard.svelte  a blackjack card face
       PackOpener.svelte   full-screen rip + swipe-reveal experience
       CardTile.svelte     a card face for grids
+      BuyTile.svelte      one buyable product + its quantity control
     server/
       db.js               file-backed JSON store (atomic writes)
       auth.js             accounts, password hashing, sessions
@@ -198,6 +340,7 @@ src/
       slots.js            server-authoritative spin (crypto RNG)
       blackjack.js        shoe, dealing, and the game loop (crypto shuffle)
       rescue.js           net-worth check + Bulk Bin failsafe grant
+      registry.js         in-memory set index, annotated with real products
       game.js             buy / open / sell / stats orchestration
   routes/
     +layout.svelte        app shell (top bar + bottom nav)
@@ -211,11 +354,18 @@ src/
     stats/                statistics
     api/(open|sell|spin| JSON endpoints for the interactive flows
         rescue|blackjack)
+    api/health/           liveness, with CORS so the Pages redirector can probe it
 scripts/
   verify-odds.mjs         odds regression harness vs published figures
   verify-slots.mjs        exact slot RTP / paytable verification
   verify-blackjack.mjs    hand evaluation, shuffle bias, measured house edge
   measure-sealed-premium.mjs  re-derives the vintage sealed premium from live prices
+pages/                    the github.io redirector (synced to the `pages` branch)
+  index.html              reads status.json, probes it, forwards to the tunnel
+  status.json             placeholder; the live one is written by run.sh
+.github/workflows/
+  publish-image.yml       build + push ghcr.io/tahuffman1s/pack-ripper
+  pages.yml               sync pages/ onto the pages branch, keeping status.json
 ```
 
 ## Notes & knobs

@@ -1,0 +1,44 @@
+# Never let these into an image layer.
+#
+# .data holds real password hashes, salts and live session tokens for every
+# registered account. Baking it into an image would ship those to wherever the
+# image goes — it is bind-mounted at runtime instead.
+.data
+
+# ~105 MB of Scryfall pools/prints, MTGJSON collation slices and TCGplayer
+# sealed prices. Regenerated data with its own TTLs, not source. Bind-mounted so
+# a rebuilt image keeps a warm cache.
+.cache
+
+node_modules
+build
+.svelte-kit
+package
+
+.git
+.gitignore
+
+# The container needs neither, and both change on every commit — keeping them
+# out means an edit to the README does not invalidate the npm ci layer.
+README.md
+scripts
+
+.env
+.env.*
+!.env.example
+
+Dockerfile
+.dockerignore
+docker-compose.yml
+run.sh
+
+# CI config and the GitHub Pages redirector. Neither is part of the app.
+.github
+pages
+
+*.log
+*.save
+*~
+.vscode
+.idea
+.DS_Store
