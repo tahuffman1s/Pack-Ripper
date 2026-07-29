@@ -8,6 +8,7 @@ import {
 	isFeatured
 } from '../catalog.js';
 import { initSealed, warmSealed, getSealed } from './tcgplayer.js';
+import { warmVintageEv } from './packvalue.js';
 
 /**
  * In-memory registry of every Magic set, annotated with the booster products it
@@ -63,8 +64,18 @@ export async function ensureSets() {
 				.filter(storeEligible)
 				.sort((a, b) => String(b.released || '').localeCompare(String(a.released || '')));
 
-			// Warm the rest of the sealed prices in the background (doesn't block).
-			warmSealed(storeList).catch((e) => console.error('warmSealed failed:', e));
+			// Warm the rest of the sealed prices in the background (doesn't block),
+			// then the vintage price floors — in that order, because a live sealed
+			// price outranks the floor, so a set that gets one needs no EV at all.
+			//
+			// The floors have to be warmed by something other than a page visit. They
+			// are what stops a 1993 booster being priced by the MSRP heuristic, which
+			// puts an Alpha pack at $43 next to singles worth thousands, and .cache is
+			// deliberately not mounted in Azure — so every revision starts cold.
+			warmSealed(storeList)
+				.catch((e) => console.error('warmSealed failed:', e))
+				.then(() => warmVintageEv(storeList))
+				.catch((e) => console.error('warmVintageEv failed:', e));
 		})();
 	}
 	await loading;

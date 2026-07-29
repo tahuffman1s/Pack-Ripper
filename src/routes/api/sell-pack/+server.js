@@ -8,7 +8,7 @@ export async function POST({ request, locals }) {
 	const setCode = String(body.setCode || '');
 	const packTypeId = String(body.packTypeId || '');
 	const qty = Math.max(1, parseInt(body.qty, 10) || 1);
-	const result = sellPacks(locals.user.id, { setCode, packTypeId, qty });
+	const result = await sellPacks(locals.user.id, { setCode, packTypeId, qty });
 	if (!result.ok) throw error(400, result.error || 'Could not sell packs.');
 	return json(result);
 }

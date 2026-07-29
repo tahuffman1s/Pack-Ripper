@@ -44,11 +44,43 @@ function persist() {
 	}
 }
 
-/** Cached EV, or null if it has not been computed yet. */
+/**
+ * Sealed product from before this date is where the floor matters: old enough
+ * that the MSRP-times-age heuristic is nonsense, and mostly not listed anywhere
+ * live. Defined here because it is a property of the floor, and read by game.js.
+ */
+export const VINTAGE_BEFORE = Date.parse('2006-01-01');
+
+export function isVintage(released) {
+	return !!released && Date.parse(released) < VINTAGE_BEFORE;
+}
+
+function entryFor(code, packTypeId) {
+	return store()[`${String(code).toLowerCase()}:${packTypeId}`] || null;
+}
+
+/**
+ * Cached EV, or null when it is missing OR old enough to be worth recomputing.
+ * This is the "do I need to do the work again" question, so it is the one
+ * packEvUsd asks itself. It is NOT the right question for pricing — see below.
+ */
 export function cachedPackEv(code, packTypeId) {
-	const e = store()[`${code}:${packTypeId}`];
+	const e = entryFor(code, packTypeId);
 	if (!e || Date.now() - e.at > TTL_MS) return null;
 	return e.ev;
+}
+
+/**
+ * The EV to use as a price floor, at ANY age.
+ *
+ * Expiring a floor is worse than using a slightly stale one. Card prices drift a
+ * few percent over a fortnight; the alternative when the floor goes missing is
+ * the heuristic, which prices an Alpha booster at $43 against singles worth
+ * thousands — a 489x error. A three-week-old $4,183 is not perfect. It is not
+ * wrong by two and a half orders of magnitude either.
+ */
+export function lastKnownPackEv(code, packTypeId) {
+	return entryFor(code, packTypeId)?.ev ?? null;
 }
 
 /**
@@ -116,4 +148,50 @@ export async function packEvUsd(code, packTypeId) {
 	store()[key] = { ev, at: Date.now() };
 	persist();
 	return ev;
+}
+
+/**
+ * Compute the floor for vintage product up front, in the background.
+ *
+ * Without this, the EV is only ever computed by a visit to /store/<set>, so the
+ * store index priced an Alpha booster at $43 until someone happened to open its
+ * page — and then at $21,179. Azure never mounts .cache, so every new revision
+ * started over from the cheap number.
+ *
+ * Bounded work: only sets old enough for the floor to bind, and only those whose
+ * EV is missing or stale. Three at a time, because each one may fetch a collation
+ * slice and a page of prices, and this is a background task with no deadline.
+ */
+export async function warmVintageEv(sets, { concurrency = 3 } = {}) {
+	const jobs = [];
+	for (const s of sets || []) {
+		if (!isVintage(s?.released)) continue;
+		for (const t of s.packTypes || []) {
+			if (cachedPackEv(s.code, t) == null) jobs.push([s.code, t]);
+		}
+	}
+	if (!jobs.length) return { computed: 0, failed: 0, skipped: 0 };
+
+	let computed = 0;
+	let failed = 0;
+	let skipped = 0;
+	let next = 0;
+	const worker = async () => {
+		while (next < jobs.length) {
+			const [code, type] = jobs[next++];
+			try {
+				const ev = await packEvUsd(code, type);
+				if (ev == null) skipped++;
+				else computed++;
+			} catch {
+				failed++;
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
+
+	console.log(
+		`vintage pack EV warmed: ${computed} computed, ${skipped} without collation, ${failed} failed`
+	);
+	return { computed, failed, skipped };
 }

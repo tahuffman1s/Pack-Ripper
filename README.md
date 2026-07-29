@@ -442,6 +442,11 @@ scripts/
 - Card data is cached for 14 days under `.cache/`; collation slices for 90 days (collation
   never changes once a set is released). Delete `.cache/` to refresh.
 - Admin access is `ADMIN_USERNAMES` and `ADMIN_TOKEN`, both off when unset — see [Admin](#admin).
+- **Vintage sealed prices depend on a computed floor.** A pre-2006 pack with no live TCGplayer
+  listing is priced from the exact EV of its print sheets (`packvalue.js`), because the MSRP×age
+  heuristic puts an Alpha booster at $43 against singles worth thousands. Those floors are warmed
+  in the background at startup and cached in `.cache/collation/_ev.json`; `buy` and `sellPacks`
+  compute one on demand rather than trust the cache, so a price never depends on cache warmth.
 
 ### Accuracy, honestly stated
 

@@ -46,7 +46,9 @@ export const actions = {
 		const kind = String(form.get('kind') || 'pack');
 		const qty = Number(form.get('qty') || 1);
 
-		const result = buy(locals.user.id, { setCode, packTypeId, kind, qty });
+		// Awaits: buy() computes the vintage price floor first if it is not already
+		// known, so what it charges cannot depend on cache warmth.
+		const result = await buy(locals.user.id, { setCode, packTypeId, kind, qty });
 		if (!result.ok) return fail(400, { error: result.error });
 		return {
 			success: true,

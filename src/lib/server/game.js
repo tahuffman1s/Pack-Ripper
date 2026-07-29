@@ -2,7 +2,7 @@ import { getDb, mutate, makeId } from './db.js';
 import { generatePack, rollSerialized } from './opener.js';
 import { pickSerial, serializedFloorUsd } from '../serialized.js';
 import { boxSizesFor, productsAvailable } from './collation.js';
-import { cachedPackEv } from './packvalue.js';
+import { lastKnownPackEv, packEvUsd, isVintage } from './packvalue.js';
 import { PACK_TYPES, packTypeById } from '../packs.js';
 import { setEntry } from './registry.js';
 import { packPriceUsd as heurPackUsd, boxPriceUsd as heurBoxUsd, sealedPremium } from '../pricing.js';
@@ -98,11 +98,12 @@ export function boxSizeFor(set, packTypeId) {
  * Mystery Boosters), and treating EV as a floor there would invent a price the
  * market does not charge.
  */
-const VINTAGE_BEFORE = Date.parse('2006-01-01');
-
 function evFloor(set, packTypeId) {
-	if (!set?.released || Date.parse(set.released) >= VINTAGE_BEFORE) return null;
-	const ev = cachedPackEv(set.code, packTypeId);
+	if (!isVintage(set?.released)) return null;
+	// Any known EV, however old — see lastKnownPackEv. A stale floor is off by a
+	// few percent; a missing one is off by 489x, because the fallback is a $3.99
+	// MSRP times an age multiplier.
+	const ev = lastKnownPackEv(set.code, packTypeId);
 	if (ev == null) return null;
 	// Sealed vintage trades well above the value of the cards inside it; the
 	// multiple is measured, not assumed. See sealedPremium() in pricing.js.
@@ -137,6 +138,28 @@ export function packPriceGold(set, packTypeId) {
 }
 export function boxPriceGold(set, packTypeId) {
 	return usdToGold(boxPriceUsd(set, packTypeId));
+}
+
+/**
+ * Make sure the vintage floor for this product exists before money moves.
+ *
+ * The floors are warmed at startup and by the set's store page, so this is
+ * normally a no-op that costs one object lookup. It is here because "normally" is
+ * not good enough on a path that charges or pays a player: with a cold floor an
+ * Alpha booster is priced at $43 and sells back at $21,179 once anything warms
+ * it, and that difference is a money printer. Pricing must not depend on whether
+ * a background task has finished.
+ */
+async function ensureVintageFloor(set, packTypeId) {
+	if (!isVintage(set?.released)) return;
+	if (lastKnownPackEv(set.code, packTypeId) != null) return;
+	try {
+		await packEvUsd(set.code, packTypeId);
+	} catch {
+		// No collation or no network. Falls through to the heuristic, which is what
+		// the price would have been anyway — but now it is the only option, not a
+		// coin flip on cache warmth.
+	}
 }
 
 /** Whether a pack price came from live TCGplayer data (vs an estimate). */
@@ -227,7 +250,7 @@ export function maxBuyQty(set, packTypeId, kind, gold) {
  * Buy `qty` of a product. Everything lands in ONE write — buying a case of
  * Play Boosters is a single flush of .data/db.json, not 216 of them.
  */
-export function buy(userId, { setCode, packTypeId, kind, qty = 1 }) {
+export async function buy(userId, { setCode, packTypeId, kind, qty = 1 }) {
 	setCode = String(setCode || '').toLowerCase();
 	const set = setEntry(setCode);
 	if (!set) return { ok: false, error: 'Unknown set.' };
@@ -243,6 +266,7 @@ export function buy(userId, { setCode, packTypeId, kind, qty = 1 }) {
 		return { ok: false, error: `That is over the ${MAX_BUY_PACKS.toLocaleString()}-pack limit for one order.` };
 	}
 
+	await ensureVintageFloor(set, packTypeId);
 	const unitPrice = kind === 'box' ? boxPriceGold(set, packTypeId) : packPriceGold(set, packTypeId);
 	const price = unitPrice * units;
 
@@ -483,10 +507,13 @@ export function sellCards(userId, uids) {
 }
 
 /** Sell unopened packs back to the store at full current market value. */
-export function sellPacks(userId, { setCode, packTypeId, qty = 1 }) {
+export async function sellPacks(userId, { setCode, packTypeId, qty = 1 }) {
 	setCode = String(setCode || '').toLowerCase();
 	const set = setEntry(setCode);
 	if (!set) return { ok: false, error: 'Unknown set.' };
+	// Buying and selling have to agree about what a pack is worth. If only one of
+	// them waits for the floor, the gap between them is free gold.
+	await ensureVintageFloor(set, packTypeId);
 	const unit = packPriceGold(set, packTypeId);
 
 	let sold = 0;
