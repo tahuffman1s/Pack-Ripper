@@ -13,12 +13,12 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    # The image contains none of these, so a doc edit or a redirector tweak
+    # The image contains none of these, so a doc edit or a deploy-script tweak
     # should not spend five minutes rebuilding it.
     paths-ignore:
-      - 'pages/**'
+      - 'azure/**'
       - 'README.md'
-      - '.github/workflows/pages.yml'
+      - '.github/workflows/deploy-azure.yml'
   workflow_dispatch:
 
 concurrency:

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /**
@@ -52,8 +52,24 @@ function flushNow() {
 	if (!db) return;
 	if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 	const tmp = DB_PATH + '.tmp';
-	writeFileSync(tmp, JSON.stringify(db, null, '\t'));
-	renameSync(tmp, DB_PATH);
+	const json = JSON.stringify(db, null, '\t');
+	writeFileSync(tmp, json);
+	try {
+		renameSync(tmp, DB_PATH);
+	} catch (e) {
+		// In Azure, .data is an Azure Files (SMB) mount, where a rename over an
+		// existing file can fail even though a plain write to the same path
+		// succeeds. Give up atomicity rather than the write: a torn db.json is a
+		// bad afternoon, a flush that silently never lands loses every account
+		// created since the last one that did.
+		console.error('Atomic rename failed, writing in place:', e);
+		writeFileSync(DB_PATH, json);
+		try {
+			unlinkSync(tmp);
+		} catch {
+			// Nothing to clean up, or the mount will not let us. Either is fine.
+		}
+	}
 }
 
 /** Debounced persistence so bursts of writes don't thrash the disk. */

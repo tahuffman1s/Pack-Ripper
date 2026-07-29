@@ -1,10 +1,9 @@
-# Optional convenience file. `run.sh` does the same thing with plain
-# podman/docker commands and needs no compose provider installed — this machine
-# has none, so run.sh is the path that works out of the box.
+# Optional convenience file for running the app on this machine. `run.sh` does
+# the same thing with plain podman/docker commands and needs no compose provider
+# installed — this machine has none, so run.sh is the path that works out of the
+# box. Public hosting is Azure Container Apps; see azure/deploy.sh.
 #
-#   docker compose up -d                        # app only, http://localhost:3000
-#   docker compose --profile quick up -d        # + a random trycloudflare.com URL
-#   docker compose --profile tunnel up -d       # + your named tunnel (needs a token)
+#   docker compose up -d        # http://localhost:3000
 
 name: packripper
 
@@ -12,9 +11,7 @@ services:
   app:
     build: .
     # To run the image GitHub Actions publishes instead of building here, drop
-    # `build:` and use image: ghcr.io/tahuffman1s/pack-ripper:latest. Note that
-    # compose has no equivalent of run.sh's URL publishing — the GitHub Pages
-    # redirector is updated by `./run.sh publish` / `./run.sh watch`.
+    # `build:` and use image: ghcr.io/tahuffman1s/pack-ripper:latest
     image: packripper:latest
     container_name: packripper
     restart: unless-stopped
@@ -23,14 +20,10 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-2M}
-      # How the app works out which origin it is serving. SvelteKit rejects any
-      # POST whose Origin header disagrees, so getting this wrong breaks every
-      # login and purchase while pages keep loading fine. Set PUBLIC_URL for a
-      # named tunnel; left empty, the forwarded headers Cloudflare sends are used
-      # instead, which is what lets a random quick-tunnel URL work unconfigured.
-      ORIGIN: ${PUBLIC_URL:-}
-      PROTOCOL_HEADER: x-forwarded-proto
-      HOST_HEADER: x-forwarded-host
+      # SvelteKit rejects any POST whose Origin header disagrees with the origin
+      # it thinks it is serving, so a wrong value here does not break pages — it
+      # breaks every login and purchase. Pin it to the address you type.
+      ORIGIN: http://localhost:${PORT:-3000}
     volumes:
       # :z — SELinux is enforcing on Fedora, and a shared label (not :Z) keeps
       # these usable by a natively-run `npm run dev` against the same data.
@@ -38,28 +31,3 @@ services:
       - ./.cache:/app/.cache:z
     ports:
       - "127.0.0.1:${PORT:-3000}:3000"
-
-  # A stable public hostname. Create the tunnel in the Cloudflare dashboard,
-  # point its public hostname at http://packripper:3000, put the connector token
-  # in .env.
-  tunnel:
-    image: docker.io/cloudflare/cloudflared:latest
-    container_name: packripper-tunnel
-    restart: unless-stopped
-    profiles: [tunnel]
-    depends_on:
-      app:
-        condition: service_healthy
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env}
-
-  # A throwaway URL, no Cloudflare account. Read it out of the logs:
-  #   docker compose logs quicktunnel | grep trycloudflare
-  quicktunnel:
-    image: docker.io/cloudflare/cloudflared:latest
-    container_name: packripper-quicktunnel
-    restart: unless-stopped
-    profiles: [quick]
-    depends_on:
-      app:
-        condition: service_healthy
-    command: tunnel --no-autoupdate --url http://packripper:3000

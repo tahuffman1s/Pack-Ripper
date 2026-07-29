@@ -32,9 +32,9 @@ Dockerfile
 docker-compose.yml
 run.sh
 
-# CI config and the GitHub Pages redirector. Neither is part of the app.
+# CI config and the Azure deployment scripts. Neither is part of the app.
 .github
-pages
+azure
 
 *.log
 *.save

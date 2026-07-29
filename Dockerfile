@@ -26,19 +26,22 @@ RUN npm run build
 FROM node:22-alpine AS runtime
 WORKDIR /app
 
-# curl is only here for HEALTHCHECK; run.sh waits on that before it opens the
-# tunnel, so the public URL never points at a server still warming up.
+# curl is only here for HEALTHCHECK, which run.sh's startup wait also uses. The
+# Azure Container Apps probes hit /api/health over the network instead, so they
+# do not need it.
 RUN apk add --no-cache curl
 
 COPY --from=build /app/build ./build
 
-# Both are bind-mounted by run.sh / compose. Declared anyway so an unmounted
-# container still boots (it just starts with an empty vault and a cold cache).
+# Bind-mounted by run.sh / compose; in Azure only .data is mounted, from a file
+# share. Declared anyway so an unmounted container still boots (it just starts
+# with an empty vault and a cold cache).
 RUN mkdir -p /app/.data /app/.cache
 VOLUME ["/app/.data", "/app/.cache"]
 
 # HOST=0.0.0.0 so the port is reachable from outside the container; adapter-node
-# otherwise binds loopback and cloudflared cannot see it.
+# otherwise binds loopback, and neither a published port nor Azure's ingress can
+# reach it.
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000

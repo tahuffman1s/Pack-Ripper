@@ -20,10 +20,6 @@ vite.config.ts.timestamp-*
 # and goes stale — regenerated data, not source.
 /.cache
 
-# The URL watcher's pid and log (./run.sh up --watch)
-/.watch.pid
-/.watch.log
-
 # Logs
 *.log
 npm-debug.log*
