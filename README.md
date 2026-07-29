@@ -230,10 +230,9 @@ podman pull ghcr.io/tahuffman1s/pack-ripper:latest     # or ./run.sh pull
 Tags are `latest` (main), `sha-<short>` for every commit, and `v*` for tags. No secrets
 involved — the workflow's automatic `GITHUB_TOKEN` can write packages. Two things to know:
 
-- **The package starts private.** After the first successful run, open the package's settings
-  under your profile → Packages → `pack-ripper` → Danger Zone and set the visibility to
-  public if you want `podman pull` to work without a login. Otherwise
-  `podman login ghcr.io -u <you> --password-stdin` with a token that has `read:packages`.
+- **It is public because the repo is**, and pulls anonymously with no login. If you ever find
+  it private — GHCR does not always inherit — flip it under your profile → Packages →
+  `pack-ripper` → Package settings → Change visibility.
 - **`linux/amd64` only.** Adding `linux/arm64` to `platforms:` works, but `npm ci` and the
   vite build then run under QEMU and the job goes from ~3 minutes to ~20.
 

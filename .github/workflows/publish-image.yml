@@ -4,10 +4,9 @@
 #   ghcr.io/tahuffman1s/pack-ripper:latest
 #
 # GHCR needs no secrets — the automatic GITHUB_TOKEN can write packages as long
-# as the job asks for the permission below. One manual step after the first run:
-# the new package starts private, so open
-# github.com/users/<you>/packages/container/pack-ripper/settings and set the
-# visibility to public if you want `podman pull` to work without a login.
+# as the job asks for the permission below. The package took this repo's public
+# visibility and pulls anonymously; if a fork finds it private instead, flip it
+# at github.com/users/<you>/packages/container/pack-ripper/settings.
 name: image
 
 on:
