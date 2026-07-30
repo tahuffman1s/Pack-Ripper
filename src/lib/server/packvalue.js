@@ -155,7 +155,7 @@ export async function packEvUsd(code, packTypeId) {
  *
  * Without this, the EV is only ever computed by a visit to /store/<set>, so the
  * store index priced an Alpha booster at $43 until someone happened to open its
- * page — and then at $21,179. Azure never mounts .cache, so every new revision
+ * page — and then at $21,179. A host that does not persist .cache means every start
  * started over from the cheap number.
  *
  * Bounded work: only sets old enough for the floor to bind, and only those whose

@@ -1,8 +1,8 @@
 # PackRipper on an Oracle Cloud Always Free ARM instance.
 #
-# Two containers: the app, and Caddy in front of it for TLS. Oracle gives you a
-# VM and a public IP and nothing else — no managed ingress, no certificate — so
-# the thing Azure Container Apps did for free is this file's second service.
+# Three containers: the app, the Postgres holding every account, and Caddy in
+# front for TLS. Oracle gives you a VM and a public IP and nothing else — no
+# managed ingress, no certificate — so terminating TLS is this file's job.
 #
 # Copy this directory to the VM, fill in .env, and:
 #
@@ -14,12 +14,51 @@
 name: packripper
 
 services:
+  db:
+    # Pinned to a major version deliberately: Postgres refuses to read a data
+    # directory written by a newer major, so a floating tag turns a routine `pull`
+    # into a container that will not start until someone runs pg_upgrade.
+    image: postgres:17-alpine
+    container_name: packripper-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-packripper}
+      POSTGRES_DB: ${POSTGRES_DB:-packripper}
+      # `:?` rather than a default — this one faces the internet, even if only via
+      # the compose network. Generate one with `openssl rand -base64 24`.
+      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env - generate one with openssl rand -base64 24}'
+      # A subdirectory of the mount: initdb refuses a non-empty directory and an
+      # ext4 bind mount arrives with a lost+found in it.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      # A bind mount, matching the app's, because a thing you back up is a thing
+      # you should be able to find. It sits on the VM's own block storage.
+      - ./.pgdata:/var/lib/postgresql/data
+    # No `ports:`. Reachable from the app over the compose network and from
+    # nowhere else. By hand:  docker compose exec db psql -U packripper packripper
+    healthcheck:
+      # -U matters: without it pg_isready asks after a database named `root` and
+      # calls a perfectly healthy server unhealthy.
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-packripper} -d ${POSTGRES_DB:-packripper} -q']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
   app:
     image: ghcr.io/tahuffman1s/pack-ripper:${TAG:-latest}
     container_name: packripper
     restart: unless-stopped
+    depends_on:
+      db:
+        # The app applies its schema at boot and exits if it cannot connect. It
+        # retries first, so this only spares it doing so on every cold start.
+        condition: service_healthy
     environment:
       NODE_ENV: production
+      # `db` is the service name, resolved on the compose network. Built from the
+      # same variable Postgres was created with, so the two cannot drift.
+      DATABASE_URL: 'postgres://${POSTGRES_USER:-packripper}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-packripper}'
       HOST: 0.0.0.0
       PORT: 3000
       BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-2M}
@@ -31,13 +70,14 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       ADMIN_USERNAMES: ${ADMIN_USERNAMES:-}
     volumes:
-      # Bind mounts rather than named volumes, because .data is the entire
-      # database and a thing you back up is a thing you should be able to find.
-      # Both sit on the VM's own block storage — the whole reason a VM is a
-      # better fit than Container Apps, where .cache had to stay off the Azure
-      # Files mount to avoid reading 30,000 small files over SMB.
-      - ./.data:/app/.data
+      # ~100 MB of regenerated Scryfall, MTGJSON and TCGplayer data, read as
+      # thousands of small files. On the VM's own block storage, which is the
+      # whole reason a VM suits this app.
       - ./.cache:/app/.cache
+      # NOT the database — that is the db service above. Mounted for one reason: a
+      # legacy .data/db.json in here is imported into an empty database on first
+      # boot, and left untouched. After that this line can go.
+      - ./.data:/app/.data
     # Not `ports:`. 3000 is reachable from Caddy over the compose network and
     # from nowhere else, so there is no unencrypted way in from the internet.
     # The admin CLI still works — it runs inside the container over loopback:

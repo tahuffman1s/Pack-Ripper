@@ -18,9 +18,10 @@
     "puppeteer": "^25.4.0",
     "svelte": "^5.1.0",
     "tailwindcss": "^4.0.0",
+    "three": "^0.171.0",
     "vite": "^6.0.0"
   },
   "dependencies": {
-    "three": "^0.171.0"
+    "pg": "^8.22.0"
   }
 }

@@ -14,9 +14,9 @@ export async function POST({ request, locals }) {
 	let result;
 	if (action === 'deal') {
 		const bet = Number(body?.bet);
-		result = deal(locals.user.id, Number.isFinite(bet) ? bet : NaN);
+		result = await deal(locals.user.id, Number.isFinite(bet) ? bet : NaN);
 	} else if (MOVES.has(action)) {
-		result = act(locals.user.id, action);
+		result = await act(locals.user.id, action);
 	} else {
 		throw error(400, 'Unknown action.');
 	}

@@ -3,9 +3,11 @@
 #
 #   ghcr.io/tahuffman1s/pack-ripper:latest
 #
-# That is the whole pipeline. Nothing here deploys: the hosts are managed by
-# hand, and a new tag in the registry does not restart anything on its own — see
-# the run summary, which prints the exact strings each one asks for.
+# That is the whole pipeline. Nothing here deploys, in the sense that this job
+# never reaches out to a host: it pushes a tag and stops. What happens next is
+# the host's business — a Pi installed by deploy/pi/install.sh polls for `latest`
+# on a timer and picks this up within the quarter hour, and anything pinned to a
+# sha- tag waits to be told. The run summary prints the strings for the latter.
 #
 # GHCR needs no secrets — the automatic GITHUB_TOKEN can write packages as long
 # as the job asks for the permission below. The package took this repo's public
@@ -160,7 +162,9 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$METADATA") \
             "${refs[@]}"
 
-      # Deploying is manual, so the summary is written to be pasted from.
+      # A pinned host is deployed by hand, so the summary is written to be pasted
+      # from. A Pi following `latest` needs none of it and will have this build
+      # within the quarter hour.
       - name: Summary
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
@@ -181,19 +185,21 @@ jobs:
             echo
             echo '### To deploy this build'
             echo
-            echo 'On a host running `deploy/oracle/compose.yml`:'
+            echo 'A Pi set up by `deploy/pi/install.sh` is already following `latest` and will'
+            echo 'take this within ~15 minutes, health-check it, and roll back by itself if it'
+            echo 'does not answer. Nothing to do.'
+            echo
+            echo 'Everywhere else — or to pin this exact build — set the immutable tag and pull'
+            echo 'just the app:'
             echo
             echo '```'
-            echo "TAG=$sha_tag docker compose up -d"
+            echo "sed -i 's/^TAG=.*/TAG=$sha_tag/' .env"
+            echo 'docker compose pull app && docker compose up -d app'
             echo '```'
             echo
-            echo 'On Azure Container Apps, create a new revision — it does not pull a new tag by itself:'
+            echo "Image: \`${image#ghcr.io/}:$sha_tag\` — app listens on \`3000\`."
             echo
-            echo '| Portal field | Value |'
-            echo '| --- | --- |'
-            echo '| Image source | Docker Hub or other registries |'
-            echo '| Registry login server | `ghcr.io` |'
-            echo '| Authentication | Public |'
-            echo "| Image and tag | \`${image#ghcr.io/}:$sha_tag\` |"
-            echo '| Target port | `3000` |'
+            echo 'Leave the `db` service alone. It is pinned to a Postgres major on purpose:'
+            echo 'a newer major will not read a data directory written by an older one, so'
+            echo 'bumping it needs a pg_dump in hand, not a `pull`.'
           } >> "$GITHUB_STEP_SUMMARY"

@@ -46,7 +46,7 @@ export async function POST({ request, locals }) {
 		if (who) actor.name = `cli:${who}`;
 	}
 
-	const result = runAdminAction(actor, body.action, body);
+	const result = await runAdminAction(actor, body.action, body);
 	if (!result.ok) throw error(400, result.error);
 	return json(result, { headers: { 'cache-control': 'no-store' } });
 }

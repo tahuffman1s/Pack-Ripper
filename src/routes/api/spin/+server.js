@@ -11,7 +11,7 @@ export async function POST({ request, locals }) {
 	const body = await request.json().catch(() => ({}));
 	const bet = Number(body?.bet);
 	const lines = Number(body?.lines);
-	const result = spin(locals.user.id, {
+	const result = await spin(locals.user.id, {
 		bet: Number.isFinite(bet) ? bet : undefined,
 		lines: Number.isFinite(lines) ? lines : undefined
 	});

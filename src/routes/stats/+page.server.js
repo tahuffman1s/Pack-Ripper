@@ -1,10 +1,23 @@
-import { getStats, getWallet, collectionValue, getCollection, getInventory } from '$lib/server/game.js';
+import {
+	getStats,
+	getWallet,
+	collectionValue,
+	collectionCount,
+	inventoryCount
+} from '$lib/server/game.js';
 import { setEntry } from '$lib/server/registry.js';
 
 /** @type {import('./$types').PageServerLoad} */
-export function load({ locals }) {
-	const stats = getStats(locals.user.id);
-	const collection = getCollection(locals.user.id);
+export async function load({ locals }) {
+	// The collection is counted, not loaded: this page shows a total and a count,
+	// and it used to fetch every card to produce both.
+	const [stats, wallet, value, cards, packs] = await Promise.all([
+		getStats(locals.user.id),
+		getWallet(locals.user.id),
+		collectionValue(locals.user.id),
+		collectionCount(locals.user.id),
+		inventoryCount(locals.user.id)
+	]);
 
 	// favourite set by packs opened
 	const bySet = Object.entries(stats.bySet || {})
@@ -13,10 +26,10 @@ export function load({ locals }) {
 
 	return {
 		stats,
-		wallet: getWallet(locals.user.id),
-		collectionValue: collectionValue(locals.user.id),
-		collectionCount: collection.length,
-		inventoryCount: getInventory(locals.user.id).length,
+		wallet,
+		collectionValue: value,
+		collectionCount: cards,
+		inventoryCount: packs,
 		bySet
 	};
 }

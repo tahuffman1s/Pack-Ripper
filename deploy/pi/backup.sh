@@ -2,6 +2,11 @@
 #
 # Hourly off-box backup of the database to a Nextcloud, over WebDAV.
 #
+# Takes a pg_dump of the Postgres container and uploads it gzipped. To restore:
+#
+#   gzip -dc db-h13.sql.gz | docker exec -i packripper-db \
+#     psql -U packripper -d packripper
+#
 # Installed as a systemd timer by install.sh; runnable by hand any time:
 #
 #   ./backup.sh            # back up now
@@ -48,13 +53,26 @@ NEXTCLOUD_URL=${NEXTCLOUD_URL:-$(env_get NEXTCLOUD_URL)}
 NEXTCLOUD_USER=${NEXTCLOUD_USER:-$(env_get NEXTCLOUD_USER)}
 NEXTCLOUD_PASS=${NEXTCLOUD_PASS:-$(env_get NEXTCLOUD_PASS)}
 NEXTCLOUD_PATH=${NEXTCLOUD_PATH:-$(env_get NEXTCLOUD_PATH)}
-DATA_DIR=${DATA_DIR:-$(env_get DATA_DIR)}
+POSTGRES_USER=${POSTGRES_USER:-$(env_get POSTGRES_USER)}
+POSTGRES_DB=${POSTGRES_DB:-$(env_get POSTGRES_DB)}
+DB_CONTAINER=${DB_CONTAINER:-packripper-db}
 
 [ -n "$NEXTCLOUD_URL" ] || { log 'NEXTCLOUD_URL is not set — backups are off'; exit 0; }
 [ -n "$NEXTCLOUD_USER" ] || die 'NEXTCLOUD_USER is not set'
 [ -n "$NEXTCLOUD_PASS" ] || die 'NEXTCLOUD_PASS is not set'
-[ -n "$DATA_DIR" ] || DATA_DIR=$HERE/.data
 [ -n "$NEXTCLOUD_PATH" ] || NEXTCLOUD_PATH=PackRipper
+[ -n "$POSTGRES_USER" ] || POSTGRES_USER=packripper
+[ -n "$POSTGRES_DB" ] || POSTGRES_DB=packripper
+
+# Whichever engine is installed. Only used to reach into the database container;
+# the backup never touches the host filesystem where the data actually lives.
+if command -v docker >/dev/null 2>&1; then
+	ENGINE=docker
+elif command -v podman >/dev/null 2>&1; then
+	ENGINE=podman
+else
+	die 'neither docker nor podman is installed'
+fi
 
 # Nextcloud's per-user WebDAV root. Trailing slashes trimmed off both parts so
 # https://cloud.example.com/ and .../ both compose correctly.
@@ -120,17 +138,65 @@ if [ "$TEST_ONLY" = 1 ]; then
 fi
 
 # ── the backup itself ──────────────────────────────────────────
-[ -d "$DATA_DIR" ] || die "$DATA_DIR does not exist"
+#
+# pg_dump, not a tar of the data directory. Two reasons, and the second is the
+# one that matters:
+#
+#   1. A dump is a stream of SQL that any Postgres can restore, including a newer
+#      major version. A copy of PGDATA is only readable by the exact major that
+#      wrote it, which makes it useless precisely when you need it most — restoring
+#      onto a fresh machine you have just installed the current Postgres on.
+#   2. pg_dump runs in a single transaction and sees ONE consistent snapshot. A tar
+#      of a live data directory does not: it reads files over several seconds while
+#      the server writes to them, and what comes out is a torn copy that may not
+#      restore at all. (The old JSON database got away with tar only because it was
+#      replaced by rename, so tar saw one whole version or the other.)
+#
+# Neither needs the app stopped.
+$ENGINE container inspect "$DB_CONTAINER" >/dev/null 2>&1 ||
+	die "no container named $DB_CONTAINER — is the stack up?"
 
-tmp=$(mktemp -t packripper-db-XXXXXX.tar.gz)
+tmp=$(mktemp -t packripper-db-XXXXXX.sql.gz)
 trap 'rm -f "$tmp"' EXIT
 
-# db.js writes db.json by rename, so tar either sees the old complete file or
-# the new one — never a half-written one. No need to stop the app.
-tar czf "$tmp" -C "$DATA_DIR" . 2>/dev/null ||
-	die "could not read $DATA_DIR (permissions?)"
+# --clean --if-exists so the dump can be replayed over a populated database
+# without dropping it by hand first.
+#
+# No -t and no -T. `docker compose exec` has a -T meaning "no TTY", but plain
+# `docker exec` and `podman exec` do not: they allocate no terminal unless asked,
+# and podman rejects -T outright with exit 125. There is no terminal in a systemd
+# timer either way.
+#
+# PIPESTATUS because `set -o pipefail` would report gzip's success; it is pg_dump
+# failing that has to be caught, and it fails by writing a short file that gzip
+# compresses perfectly happily.
+set +o pipefail
+$ENGINE exec "$DB_CONTAINER" \
+	pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists 2>/tmp/pgdump-err.$$ |
+	gzip -9 > "$tmp"
+dump_status=${PIPESTATUS[0]}
+set -o pipefail
+if [ "$dump_status" != 0 ]; then
+	die "pg_dump failed: $(tr '\n' ' ' < /tmp/pgdump-err.$$ | tail -c 300)"
+fi
+rm -f /tmp/pgdump-err.$$
+
 size=$(wc -c < "$tmp")
-[ "$size" -gt 0 ] || die 'the archive came out empty'
+# A gzip of nothing is still ~20 bytes, and a dump of an empty database is a few
+# hundred of comments and SET statements. Either would upload happily and look
+# like a backup, so the floor is well above both.
+[ "$size" -gt 2000 ] || die "the dump came out suspiciously small ($size bytes) — not uploading it"
+
+# Prove it is a complete dump and not a truncated stream. pg_dump writes this
+# marker once, at the very end, so finding it anywhere means the pipe did not die
+# halfway through.
+#
+# Deliberately grepping the WHOLE stream rather than `tail -n`: what follows the
+# marker is version-dependent. Postgres 17.6 added a trailing `\unrestrict` line
+# after it, which is exactly the kind of change that makes a `tail -3` start
+# failing on a working backup after an image bump.
+gzip -dc "$tmp" | grep -q 'PostgreSQL database dump complete' ||
+	die 'the dump has no completion marker — it was truncated'
 
 hour=$(date -u +%H)
 dow=$(date -u +%u)
@@ -145,12 +211,12 @@ upload() { # upload REMOTE_NAME
 	esac
 }
 
-upload "db-h$hour.tar.gz"
+upload "db-h$hour.sql.gz"
 
 # Spelled out rather than `[ ... ] && upload`, whose non-zero result on the other
 # 23 hours is exactly the kind of thing `set -e` argues about.
 if [ "$hour" = 04 ]; then
-	upload "db-d$dow.tar.gz"
+	upload "db-d$dow.sql.gz"
 fi
 
 exit 0

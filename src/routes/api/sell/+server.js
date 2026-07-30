@@ -7,6 +7,6 @@ export async function POST({ request, locals }) {
 	const body = await request.json().catch(() => ({}));
 	const uids = Array.isArray(body.uids) ? body.uids.map(String) : [];
 	if (!uids.length) throw error(400, 'No cards selected.');
-	const result = sellCards(locals.user.id, uids);
+	const result = await sellCards(locals.user.id, uids);
 	return json(result);
 }

@@ -8,11 +8,11 @@ export const actions = {
 		const username = String(form.get('username') || '');
 		const password = String(form.get('password') || '');
 
-		const user = verifyUser(username, password);
+		const user = await verifyUser(username, password);
 		if (!user) {
 			return fail(400, { username, error: 'Invalid username or password.' });
 		}
-		const token = createSession(user.id);
+		const token = await createSession(user.id);
 		cookies.set(SESSION_COOKIE, token, sessionCookieOptions());
 		throw redirect(303, '/');
 	}

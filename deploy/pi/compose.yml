@@ -1,24 +1,72 @@
 # PackRipper on a Raspberry Pi, published through a Cloudflare Tunnel.
 #
-# One service. cloudflared is in the image and starts beside the app whenever
-# TUNNEL_TOKEN is set, so there is no sidecar here and no second container to
-# keep in step — see ../../scripts/docker-entrypoint.sh.
+# Two services: the app, and Postgres. cloudflared is in the app image and starts
+# beside it whenever TUNNEL_TOKEN is set, so the tunnel is not a third container —
+# see ../../scripts/docker-entrypoint.sh.
 #
 # Nothing here publishes a port. cloudflared makes an OUTBOUND connection to
 # Cloudflare and traffic comes back down it, so there is no port forward on the
 # router, no inbound hole in the firewall, and no certificate to renew — the app
 # is reachable on the container's own loopback by cloudflared and by nothing
-# else on earth. That is a better security posture than the Oracle setup next
-# door, not a worse one.
+# else on earth. Postgres is reachable only by the app, over the compose network,
+# and is not published even to the LAN. That is a better security posture than the
+# Oracle setup next door, not a worse one.
 #
 #   cp .env.example .env && vi .env && docker compose up -d
 #
-# See ../../README.md § Hosting it on a Raspberry Pi. Read the DATA_DIR note
-# there before running this off an SD card.
+# See ../../README.md § Hosting it on a Raspberry Pi. Read the DB_DIR note there
+# before running this off an SD card.
 
 name: packripper
 
 services:
+  db:
+    # Official multi-arch image, so this pulls arm64 on a Pi with no override.
+    # Pinned to a major version deliberately: Postgres does NOT read a data
+    # directory written by a newer major, so a floating tag turns a routine
+    # `docker compose pull` into a container that will not start until someone
+    # runs pg_upgrade. Bump this line on purpose, with a dump in hand.
+    image: postgres:17-alpine
+    container_name: packripper-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-packripper}
+      POSTGRES_DB: ${POSTGRES_DB:-packripper}
+      # `:?` rather than a default. A database whose password is a value copied
+      # out of an example file is not protected by having one, and this is the
+      # only secret here that cannot be rotated without a dump and restore.
+      # `./install.sh` generates one; `openssl rand -base64 24` also does.
+      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env - generate one with openssl rand -base64 24}'
+      # A SUBDIRECTORY of the mount, not the mount itself. initdb refuses to run
+      # in a non-empty directory, and a bind mount can arrive with a lost+found
+      # in it — which on an ext4 SSD is exactly what happens. This is the
+      # documented shape for a bind-mounted PGDATA.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      # THE database. Point this at an SSD if the Pi boots off an SD card.
+      #
+      # This is the setting that decides whether the storage survives the year,
+      # and it is worth knowing that it matters much less than the equivalent
+      # setting used to. The old JSON database rewrote every account on every slot
+      # spin and every blackjack hit — megabytes per click, all of it landing on
+      # the same few flash blocks. Postgres writes the row that changed plus a WAL
+      # record, so the same spin is now kilobytes. An SD card will still wear out
+      # faster than an SSD; it will just take a great deal longer.
+      - ${DB_DIR:-./.pgdata}:/var/lib/postgresql/data
+    # No `ports:`. Postgres is on the compose network and nowhere else. To poke at
+    # it by hand, go through the container:
+    #   docker compose exec db psql -U packripper packripper
+    healthcheck:
+      # -U matters: without it pg_isready asks after a database named `root` and
+      # reports the server as unhealthy while it is running perfectly.
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-packripper} -d ${POSTGRES_DB:-packripper} -q']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # A Pi doing first-run initdb on a cold SSD is slow. This is the window in
+      # which failures do not count against `retries`.
+      start_period: 60s
+
   app:
     # A manifest list since the arm64 half was added, so this pulls the right
     # architecture on a Pi with no `platform:` override. 64-bit OS required —
@@ -26,11 +74,22 @@ services:
     image: ghcr.io/tahuffman1s/pack-ripper:${TAG:-latest}
     container_name: packripper
     restart: unless-stopped
+    depends_on:
+      db:
+        # Not just `started`. The app applies its schema at boot and exits if it
+        # cannot connect, so starting it against a Postgres still running initdb
+        # means a container that restart-loops for a minute for no reason. It does
+        # retry on its own — this just means it does not have to.
+        condition: service_healthy
     environment:
       NODE_ENV: production
       HOST: 0.0.0.0
       PORT: 3000
       BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-2M}
+      # `db` is the service name above, resolved on the compose network. The
+      # password is interpolated from the same variable Postgres was created with,
+      # so the two cannot drift apart.
+      DATABASE_URL: 'postgres://${POSTGRES_USER:-packripper}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-packripper}'
       # The public name Cloudflare serves, not the Pi's LAN address. SvelteKit
       # rejects any POST whose Origin disagrees with the origin it believes it is
       # serving, and cloudflared forwards plain HTTP — so the app cannot work
@@ -50,13 +109,15 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       ADMIN_USERNAMES: ${ADMIN_USERNAMES:-}
     volumes:
-      # Both default to beside this file, and both should be pointed at an SSD if
-      # this Pi boots off an SD card. db.js rewrites the WHOLE database on every
-      # mutation — every slot spin, every blackjack hit — and that file is
-      # already megabytes. See the README; this is the one setting on a Pi that
-      # decides whether the storage survives the year.
-      - ${DATA_DIR:-./.data}:/app/.data
+      # .cache is ~100 MB of regenerated Scryfall, MTGJSON and TCGplayer data. It
+      # is read as thousands of small files and is worth having on the SSD too,
+      # but losing it costs a slow first minute and nothing else.
       - ${CACHE_DIR:-./.cache}:/app/.cache
+      # NOT the database any more — that is the db service above. This is mounted
+      # for exactly one reason: if a .data/db.json from the old file-backed
+      # version is in here, the app imports it into an empty database on first
+      # boot and leaves the file alone. Once that has happened this line can go.
+      - ${DATA_DIR:-./.data}:/app/.data
     # Not `ports:`. Add `- "3000:3000"` only if you want it on the LAN too.
     # The admin CLI does not need it — it runs inside the container on loopback:
     #   docker exec -it packripper admin list

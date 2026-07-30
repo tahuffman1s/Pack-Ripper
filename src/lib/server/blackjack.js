@@ -9,18 +9,22 @@
  * The shuffle is a Fisher-Yates using node:crypto randomInt — unbiased, unlike
  * the sort-by-random trick — and the shoe persists across rounds so the game
  * behaves like a real six-deck table rather than a fresh deck every hand.
+ *
+ * The table is one jsonb row per player. finish() and advance() used to be handed
+ * the whole database so they could credit a wallet and bump stats in passing; they
+ * are now handed a small `ctx` of { gold, stats } that the caller writes back
+ * once, at the end of the transaction. Same arithmetic, but the only thing that
+ * knows how to persist anything is the action that opened the transaction.
  */
 
 import { randomInt } from 'node:crypto';
-import { getDb, mutate } from './db.js';
-import { newStats } from './auth.js';
+import { query, tx, lockGold, setGold, lockStats, writeStats, readStats } from './db.js';
 import {
 	buildShoe,
 	handValue,
 	legalMoves,
 	dealerShouldHit,
 	settleHand,
-	isPair,
 	cardRank,
 	isValidBet,
 	MAX_HANDS,
@@ -55,16 +59,37 @@ function ensureShoe(state) {
 	}
 }
 
-function tableOf(userId) {
-	return getDb().blackjack?.[userId] || null;
+/** Read a table without locking, for display. */
+async function tableOf(userId) {
+	const { rows } = await query('SELECT state FROM blackjack WHERE user_id = $1', [userId]);
+	return rows[0]?.state || null;
+}
+
+/** Read a table and hold the row for the rest of the transaction. */
+async function lockTable(client, userId) {
+	const { rows } = await client.query(
+		'SELECT state FROM blackjack WHERE user_id = $1 FOR UPDATE',
+		[userId]
+	);
+	return rows[0]?.state || null;
+}
+
+async function writeTable(client, userId, state) {
+	await client.query(
+		`INSERT INTO blackjack (user_id, state) VALUES ($1, $2::jsonb)
+		 ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state`,
+		[userId, JSON.stringify(state)]
+	);
 }
 
 /**
  * What the client is allowed to see. The shoe is stripped entirely and the
  * dealer's hole card only appears once the round is over.
+ *
+ * Pure: it takes the table and the balance rather than fetching either, so an
+ * action can render the state it has just written without reading it back.
  */
-export function publicView(userId) {
-	const t = tableOf(userId);
+function publicView(t, gold) {
 	if (!t) return null;
 	const revealed = t.phase === 'done';
 	const dealerCards = revealed ? t.dealer : t.dealer.slice(0, 1);
@@ -84,7 +109,7 @@ export function publicView(userId) {
 			moves:
 				t.phase === 'player' && i === t.active
 					? legalMoves(h, {
-							gold: getDb().wallets[userId]?.gold ?? 0,
+							gold,
 							canSplitMore: t.hands.length < MAX_HANDS
 						})
 					: []
@@ -100,8 +125,20 @@ export function publicView(userId) {
 	};
 }
 
-/** Play the dealer out and settle every hand. Mutates `t`, returns net delta. */
-function finish(t, userId, d) {
+/** The table as the page needs it, with the balance the moves are judged against. */
+export async function tableState(userId) {
+	const [t, { rows }] = await Promise.all([
+		tableOf(userId),
+		query('SELECT gold FROM wallets WHERE user_id = $1', [userId])
+	]);
+	return publicView(t, rows[0]?.gold ?? 0);
+}
+
+/**
+ * Play the dealer out and settle every hand. Mutates `t` and `ctx`, returns net
+ * delta.
+ */
+function finish(t, ctx) {
 	// The dealer only draws if at least one hand is still live; with everyone
 	// bust or holding a blackjack the extra cards would be pure theatre and
 	// would burn shoe position that a counting player could reason about.
@@ -122,14 +159,14 @@ function finish(t, userId, d) {
 	t.phase = 'done';
 	t.totalDelta = delta;
 
-	d.wallets[userId].gold += payout;
+	ctx.gold += payout;
 
-	const s = (d.stats[userId] ??= newStats());
+	const s = ctx.stats;
 	s.bjRounds = (s.bjRounds || 0) + 1;
 	s.bjHands = (s.bjHands || 0) + t.hands.length;
 	s.bjWagered = (s.bjWagered || 0) + t.hands.reduce((a, h) => a + h.bet, 0);
 	s.bjNet = (s.bjNet || 0) + delta;
-	if (delta > 0) s.goldEarned += delta;
+	if (delta > 0) s.goldEarned = (s.goldEarned || 0) + delta;
 	for (const h of t.hands) {
 		if (h.outcome === 'blackjack') s.bjBlackjacks = (s.bjBlackjacks || 0) + 1;
 		else if (h.outcome === 'win') s.bjWins = (s.bjWins || 0) + 1;
@@ -141,28 +178,27 @@ function finish(t, userId, d) {
 }
 
 /** Advance to the next hand that still needs a decision, or run the dealer. */
-function advance(t, userId, d) {
+function advance(t, ctx) {
 	while (t.active < t.hands.length && t.hands[t.active].done) t.active++;
-	if (t.active >= t.hands.length) finish(t, userId, d);
+	if (t.active >= t.hands.length) finish(t, ctx);
 }
 
 // ── Actions ────────────────────────────────────────────────────
 
-export function deal(userId, bet) {
-	const db = getDb();
-	const wallet = db.wallets[userId];
-	if (!wallet) return { ok: false, error: 'No wallet.' };
-	if (!isValidBet(bet)) return { ok: false, error: 'Invalid bet.' };
+export async function deal(userId, bet) {
+	return tx(async (client) => {
+		const gold = await lockGold(client, userId);
+		if (gold == null) return { ok: false, error: 'No wallet.' };
+		if (!isValidBet(bet)) return { ok: false, error: 'Invalid bet.' };
 
-	const existing = tableOf(userId);
-	if (existing && existing.phase !== 'done') {
-		return { ok: false, error: 'Finish the hand you are playing.' };
-	}
-	if (wallet.gold < bet) return { ok: false, error: `You need ${bet} gold for that bet.` };
+		const prev = await lockTable(client, userId);
+		if (prev && prev.phase !== 'done') {
+			return { ok: false, error: 'Finish the hand you are playing.' };
+		}
+		if (gold < bet) return { ok: false, error: `You need ${bet} gold for that bet.` };
 
-	mutate((d) => {
-		const prev = d.blackjack?.[userId];
 		const t = {
+			// The shoe survives the round, which is the point of a six-deck table.
 			shoe: prev?.shoe ?? null,
 			shuffled: false,
 			phase: 'player',
@@ -174,9 +210,9 @@ export function deal(userId, bet) {
 		};
 		ensureShoe(t);
 
-		d.wallets[userId].gold -= bet;
-		const s = (d.stats[userId] ??= newStats());
-		s.goldSpent += bet;
+		const ctx = { gold, stats: await lockStats(client, userId) };
+		ctx.gold -= bet;
+		ctx.stats.goldSpent = (ctx.stats.goldSpent || 0) + bet;
 
 		// Deal in the real order: player, dealer, player, dealer-hole.
 		t.hands[0].cards.push(draw(t));
@@ -190,51 +226,58 @@ export function deal(userId, bet) {
 		const dv = handValue(t.dealer);
 		if (pv.blackjack || dv.blackjack) {
 			t.hands[0].done = true;
-			finish(t, userId, d);
+			finish(t, ctx);
 		}
 
-		(d.blackjack ??= {})[userId] = t;
-	});
+		await writeTable(client, userId, t);
+		await setGold(client, userId, ctx.gold);
+		await writeStats(client, userId, ctx.stats);
 
-	return { ok: true, table: publicView(userId), gold: getDb().wallets[userId].gold };
+		return { ok: true, table: publicView(t, ctx.gold), gold: ctx.gold };
+	});
 }
 
-export function act(userId, action) {
-	const db = getDb();
-	const t = tableOf(userId);
-	if (!t) return { ok: false, error: 'No hand in play.' };
-	if (t.phase !== 'player') return { ok: false, error: 'The hand is already finished.' };
+export async function act(userId, action) {
+	return tx(async (client) => {
+		const gold = await lockGold(client, userId);
+		if (gold == null) return { ok: false, error: 'No wallet.' };
 
-	const hand = t.hands[t.active];
-	if (!hand) return { ok: false, error: 'No active hand.' };
+		const t = await lockTable(client, userId);
+		if (!t) return { ok: false, error: 'No hand in play.' };
+		if (t.phase !== 'player') return { ok: false, error: 'The hand is already finished.' };
 
-	const allowed = legalMoves(hand, {
-		gold: db.wallets[userId]?.gold ?? 0,
-		canSplitMore: t.hands.length < MAX_HANDS
-	});
-	if (!allowed.includes(action)) return { ok: false, error: `You cannot ${action} right now.` };
+		const hand = t.hands[t.active];
+		if (!hand) return { ok: false, error: 'No active hand.' };
 
-	mutate((d) => {
-		const table = d.blackjack[userId];
-		table.shuffled = false;
-		const h = table.hands[table.active];
+		// Judged against the locked balance, inside the transaction that will spend
+		// it. Two "double" requests fired at once can no longer both be told yes
+		// against a balance that only covers one of them.
+		const allowed = legalMoves(hand, {
+			gold,
+			canSplitMore: t.hands.length < MAX_HANDS
+		});
+		if (!allowed.includes(action)) return { ok: false, error: `You cannot ${action} right now.` };
+
+		const ctx = { gold, stats: await lockStats(client, userId) };
+		t.shuffled = false;
+		const h = t.hands[t.active];
 
 		if (action === 'hit') {
-			h.cards.push(draw(table));
+			h.cards.push(draw(t));
 			const v = handValue(h.cards);
 			if (v.bust || v.total === 21) h.done = true;
 		} else if (action === 'stand') {
 			h.done = true;
 		} else if (action === 'double') {
-			d.wallets[userId].gold -= h.bet;
-			(d.stats[userId] ??= newStats()).goldSpent += h.bet;
+			ctx.gold -= h.bet;
+			ctx.stats.goldSpent = (ctx.stats.goldSpent || 0) + h.bet;
 			h.bet *= 2;
 			h.doubled = true;
-			h.cards.push(draw(table));
+			h.cards.push(draw(t));
 			h.done = true;
 		} else if (action === 'split') {
-			d.wallets[userId].gold -= h.bet;
-			(d.stats[userId] ??= newStats()).goldSpent += h.bet;
+			ctx.gold -= h.bet;
+			ctx.stats.goldSpent = (ctx.stats.goldSpent || 0) + h.bet;
 			const moved = h.cards.pop();
 			const splittingAces = cardRank(h.cards[0]) === 'A';
 			h.fromSplit = true;
@@ -247,9 +290,9 @@ export function act(userId, action) {
 				fromSplitAce: splittingAces
 			};
 			// Each new hand is dealt back up to two cards straight away.
-			h.cards.push(draw(table));
-			next.cards.push(draw(table));
-			table.hands.splice(table.active + 1, 0, next);
+			h.cards.push(draw(t));
+			next.cards.push(draw(t));
+			t.hands.splice(t.active + 1, 0, next);
 			// Split aces get exactly one card each and then stand.
 			if (splittingAces) {
 				h.done = true;
@@ -259,27 +302,34 @@ export function act(userId, action) {
 			}
 		}
 
-		advance(table, userId, d);
-	});
+		advance(t, ctx);
 
-	return { ok: true, table: publicView(userId), gold: getDb().wallets[userId].gold };
+		await writeTable(client, userId, t);
+		await setGold(client, userId, ctx.gold);
+		await writeStats(client, userId, ctx.stats);
+
+		return { ok: true, table: publicView(t, ctx.gold), gold: ctx.gold };
+	});
 }
 
 /** Suggested play, from the same basic-strategy table the verifier measures. */
-export function hint(userId) {
-	const t = tableOf(userId);
+export async function hint(userId) {
+	const t = await tableOf(userId);
 	if (!t || t.phase !== 'player') return null;
 	const h = t.hands[t.active];
 	if (!h) return null;
-	const allowed = legalMoves(h, {
-		gold: getDb().wallets[userId]?.gold ?? 0,
-		canSplitMore: t.hands.length < MAX_HANDS
-	});
+	const gold = await getGold(userId);
+	const allowed = legalMoves(h, { gold, canSplitMore: t.hands.length < MAX_HANDS });
 	return { allowed, hand: h.cards, dealerUp: t.dealer[0] };
 }
 
-export function blackjackStats(userId) {
-	const s = getDb().stats[userId] || {};
+async function getGold(userId) {
+	const { rows } = await query('SELECT gold FROM wallets WHERE user_id = $1', [userId]);
+	return rows[0]?.gold ?? 0;
+}
+
+export async function blackjackStats(userId) {
+	const s = await readStats(userId);
 	const wagered = s.bjWagered || 0;
 	return {
 		rounds: s.bjRounds || 0,

@@ -10,11 +10,11 @@ export const actions = {
 
 		let user;
 		try {
-			user = createUser({ username, password });
+			user = await createUser({ username, password });
 		} catch (e) {
 			return fail(400, { username, error: e.message || 'Could not create account.' });
 		}
-		const token = createSession(user.id);
+		const token = await createSession(user.id);
 		cookies.set(SESSION_COOKIE, token, sessionCookieOptions());
 		throw redirect(303, '/');
 	}

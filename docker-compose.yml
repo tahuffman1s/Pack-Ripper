@@ -1,13 +1,42 @@
 # Optional convenience file for running the app on this machine. `run.sh` does
 # the same thing with plain podman/docker commands and needs no compose provider
 # installed — this machine has none, so run.sh is the path that works out of the
-# box. Public hosting is Azure Container Apps, managed in the Portal.
+# box. Public hosting is a Raspberry Pi; see deploy/pi/.
 #
 #   docker compose up -d        # http://localhost:3000
 
 name: packripper
 
 services:
+  db:
+    # Pinned to a major version on purpose: Postgres will not read a data
+    # directory written by a newer major, so a floating tag turns a `pull` into a
+    # container that refuses to start until someone runs pg_upgrade.
+    image: postgres:17-alpine
+    container_name: packripper-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-packripper}
+      POSTGRES_DB: ${POSTGRES_DB:-packripper}
+      # Defaulted here, unlike the Pi, because this database is bound to loopback
+      # on a development machine. Set it in .env for anything you care about.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-packripper}
+    volumes:
+      # A named volume rather than a bind mount: Postgres wants a directory it
+      # owns, and on this SELinux-enforcing host a bind-mounted PGDATA needs
+      # label wrangling that a named volume simply does not.
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Published to loopback only, so psql and the migration script can reach it
+      # from the host. Change the host port with PGPORT if 5432 is taken.
+      - '127.0.0.1:${PGPORT:-5432}:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-packripper} -d ${POSTGRES_DB:-packripper} -q']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   app:
     build: .
     # To run the image GitHub Actions publishes instead of building here, drop
@@ -15,11 +44,17 @@ services:
     image: packripper:latest
     container_name: packripper
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       HOST: 0.0.0.0
       PORT: 3000
       BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-2M}
+      # `db` is the service name, resolved on the compose network — 5432 here is
+      # the container port, not the published one, so PGPORT does not belong in it.
+      DATABASE_URL: postgres://${POSTGRES_USER:-packripper}:${POSTGRES_PASSWORD:-packripper}@db:5432/${POSTGRES_DB:-packripper}
       # SvelteKit rejects any POST whose Origin header disagrees with the origin
       # it thinks it is serving, so a wrong value here does not break pages — it
       # breaks every login and purchase. Pin it to the address you type.
@@ -32,7 +67,14 @@ services:
     volumes:
       # :z — SELinux is enforcing on Fedora, and a shared label (not :Z) keeps
       # these usable by a natively-run `npm run dev` against the same data.
+      #
+      # .data is no longer the database. It is mounted so that a legacy
+      # .data/db.json is picked up and imported into an empty database on first
+      # boot; after that it can go.
       - ./.data:/app/.data:z
       - ./.cache:/app/.cache:z
     ports:
       - "127.0.0.1:${PORT:-3000}:3000"
+
+volumes:
+  pgdata:

@@ -1,10 +1,15 @@
 import { inventorySummary, getOpenings, MASS_OPEN_MAX } from '$lib/server/game.js';
 
 /** @type {import('./$types').PageServerLoad} */
-export function load({ locals }) {
+export async function load({ locals }) {
+	const [groups, recent] = await Promise.all([
+		inventorySummary(locals.user.id),
+		getOpenings(locals.user.id)
+	]);
+
 	return {
-		groups: inventorySummary(locals.user.id),
-		recent: getOpenings(locals.user.id).slice(0, 6),
+		groups,
+		recent: recent.slice(0, 6),
 		massOpenMax: MASS_OPEN_MAX
 	};
 }

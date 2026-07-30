@@ -153,15 +153,23 @@ It's a simulator: the currency is free and no real money is ever involved.
 - **MTGJSON** (MIT) for booster collation — fetched lazily per set as a `.json.gz`, gunzipped
   with `node:zlib`, and cached as a ~110 KB slice under `.cache/collation/`
 - **Scryfall API** for card data, art, treatments and prices (cached to disk under `.cache/`)
-- **Zero native dependencies** — accounts, wallets, collections and stats are stored in a
-  small file-backed JSON database under `.data/db.json`.
+- **PostgreSQL 17** for accounts, wallets, collections, stats and the serial ledger — see
+  [The database](#the-database). Still no native dependencies: `pg` is pure JavaScript.
 
 ## Running it
 
+The app needs a Postgres to talk to. The quickest one is the container the compose file already
+defines:
+
 ```bash
 npm install
+docker compose up -d db                                   # or: ./run.sh up, for the whole stack
+export DATABASE_URL=postgres://packripper:packripper@localhost:5432/packripper
 npm run dev      # http://localhost:5173
 ```
+
+The schema is applied on boot — there is no migration step to remember, and pointing the app at an
+empty database is all it takes to get a working one.
 
 Then register an account and start ripping. The first pack you open from any given set will
 take a few seconds while its card pool is fetched from Scryfall; after that it's cached.
@@ -189,19 +197,124 @@ rather than compose, so it needs no compose provider installed.
 
 Two details worth knowing:
 
-- **`.data` and `.cache` are bind-mounted**, so accounts survive a rebuild and the image
-  never contains a database. Neither directory is in the image — `.data` holds real password
-  hashes and live session tokens, and baking those into a layer would ship them wherever the
-  image goes. Under rootless podman the container writes them as your own user.
+- **The database is a second container**, and its data lives in a named volume rather than a
+  bind mount — so `./run.sh down` and `restart` cannot lose it. Only `./run.sh reset` can, and it
+  asks first. `.cache` is still bind-mounted; it holds nothing secret and losing it costs a slow
+  first minute. Nothing in either is baked into the image.
 - **The request origin has to be right.** SvelteKit refuses any POST whose `Origin` header
   disagrees with the origin it believes it is serving, and a mismatch breaks every login and
   purchase while pages keep loading normally. `run.sh` pins `ORIGIN` to
   `http://localhost:PORT`; in Azure it has to be set to the real `https://` hostname.
 
-The runtime image is ~174 MB and contains no `node_modules` at all: adapter-node bundles the
-whole server into `build/`, whose only imports are `node:` builtins.
+The runtime image carries 760 KB of `node_modules` — the Postgres driver and its dependencies,
+and nothing else. Everything else adapter-node bundles into `build/`. Vite deliberately leaves
+packages listed in `dependencies` as external imports rather than bundling them, and enumerating
+`pg`'s transitive tree in `vite.config.js` to force it would work today and break silently, in
+production only, the next time `pg` gained a package. `--omit=optional` keeps `pg-native` out, so
+there is still no native module anywhere.
 
 `docker-compose.yml` does the same thing for anyone who has a compose provider.
+
+## The database
+
+Every account, wallet, collection, pack, stat and issued serial number lives in **PostgreSQL**.
+The schema is in `src/lib/server/schema.js` and is applied on every boot; every statement is
+`IF NOT EXISTS`, so that is the whole migration story — a fresh volume becomes a working database
+and a populated one is untouched.
+
+The shape is relational where being relational buys something and `jsonb` where it does not, which
+is a line rather than a compromise. A column exists for anything the app filters, sorts, aggregates
+or constrains on. A `jsonb` blob holds records only ever read and written whole: the ~30 stats
+counters, a 312-card blackjack shoe, the tail of a card's print record. Splitting those into
+columns would add joins and migrations to serve queries nothing makes.
+
+Two things the database now enforces that used to be application logic:
+
+- **A serialized card cannot be printed twice.** `serials` has primary key `(scryfall_id, n)`, so
+  The One Ring 001/001 is unique by constraint rather than by a careful read-then-write. The ledger
+  is deliberately *not* cascade-deleted with a user — releasing #137/250 back into the pool because
+  its owner left would let a second one exist.
+- **Deleting an account cannot leave half of one behind.** Sessions, wallet, inventory, collection,
+  stats, openings, the blackjack table and free spins are all `ON DELETE CASCADE`.
+
+**Sessions expire in two places, on purpose.** `getUserFromSession` will not honour a token older
+than 30 days, and a sweep deletes those rows at boot and every six hours after. Only the first of
+those is a security boundary: the cookie's `Max-Age` governs whether a *browser* keeps sending a
+token, but a token copied out of one — a shared machine, a stolen backup — is just a string, and
+without the age test in the query it would authenticate forever. The sweep is housekeeping, because
+rows outlive the cookies that reference them: a browser stops sending an expired token and never
+tells the server, so the table would only ever grow. Its timer is `unref()`'d, so it can never be
+the reason a process that was ready to exit does not — see the shutdown note under
+[Notes & knobs](#notes--knobs).
+
+### Why it stopped being a JSON file
+
+The old design kept everything in memory and rewrote **the entire database** on every mutation.
+Not scale — 71 accounts and 3,153 cards is nothing — but three specific costs:
+
+- Write cost grew with the size of the *whole server* rather than the size of the change. One
+  blackjack hit rewrote all 71 accounts: ~4 MB, measured at ~20 ms on NVMe and far worse on a
+  network share or an SD card.
+- About 250 of `db.js`'s 393 lines were defending one file against torn writes, unattached volumes
+  and SMB rename semantics. None of those are the application's to survive, and none of that code
+  exists now.
+- It capped the app at one replica, and made every read-then-write correct only by accident of
+  being synchronous.
+
+That last point is the one to understand if you touch this code. The old data layer was
+synchronous, which made every read-then-write atomic for free — nothing could interleave between
+`if (wallet.gold < cost)` and `wallet.gold -= cost`. Every one of those now has an `await` in the
+middle. **So every path that moves money takes a row lock on the wallet first**, via `lockGold()`
+in `db.js`, and does its arithmetic after. That is not an optimisation; it is what restores a
+guarantee the synchronous version had by accident. Two concurrent buys against a two-pack balance
+now buy two packs, not twenty.
+
+Going relational also fixed a race the old code genuinely had: two concurrent opens of the same
+pack both found it in the array, both rolled it, and both banked their cards while only one removed
+the pack. Openings now `DELETE ... RETURNING` the inventory rows first and bank only the packs whose
+row they actually claimed.
+
+### Migrating from `.data/db.json`
+
+Automatic. On boot, if the database has **zero accounts** and a `.data/db.json` exists, it is
+imported in one transaction and the file is left untouched. That guard is the whole design: it can
+only ever add data to an empty database, never overwrite a populated one, so it is safe to leave
+enabled forever rather than being a step someone has to remember exactly once.
+
+Note the guard is the opposite shape to the one the old loader needed. That code had to decide
+whether a missing file meant "first boot" or "the volume is not mounted", because it was about to
+*write*, and guessing wrong destroyed 71 accounts. Nothing here can destroy anything — the worst
+case is that an import does not happen, and the fix is to restart with the file present.
+
+To look before you leap, or to import into a database the app is not running against yet:
+
+```bash
+node scripts/import-json-db.js --dry-run    # counts what it would import, connects to nothing
+DATABASE_URL=postgres://... node scripts/import-json-db.js
+```
+
+Set `IMPORT_LEGACY_JSON=0` to start deliberately empty with the old file still sitting there.
+
+### Two duplicated money rules, and what keeps them honest
+
+`src/lib/server/economySql.js` reimplements `usdToGold()` and `cardSellGold()` in SQL, because
+valuing a collection is a `SUM` over a few thousand rows and the layout asks for that total on
+*every* page load — shipping every row out to add up one number was the most wasteful thing the old
+layer did on a hot path.
+
+A duplicated money rule is only acceptable if something checks it:
+
+```bash
+DATABASE_URL=postgres://... node scripts/verify-gold-sql.mjs
+```
+
+It runs both implementations over every distinct price in the live database plus a list of awkward
+ones, and fails on any disagreement. It has already earned its keep: the first version of the SQL
+cast to `numeric` on the reasoning that exact arithmetic could not mis-round, and that cast changed
+the value — `1.005::double` is really `1.00499999999999989`, and casting yields the shortest decimal
+that round-trips, so the product became exactly `100.5` and rounded *up* where JS rounds down. The
+SQL now does the arithmetic in double precision and uses `FLOOR(x + 0.5)`, which is what
+`Math.round` is specified to be. If you change `economy.js`, change that file, and run this.
 
 ## Admin
 
@@ -283,10 +396,11 @@ dull audit trail.
 
 Three details that are deliberate rather than incidental:
 
-- **The CLI does not edit `.data/db.json`.** `db.js` keeps the whole database in memory and writes
-  all of it back on every mutation, so a second process editing that file would have its work
-  silently overwritten by the next thing any player did. Going through the app is the only way a
-  change sticks — which is also why the CLI needs the app up.
+- **The CLI talks HTTP, not SQL.** It could connect to Postgres directly now — the old reason it
+  could not (the app held everything in memory and would overwrite any outside edit) is gone. It
+  still does not, and that is the better answer: it needs no database credentials, it gets the same
+  validation as the panel, and every action lands in the same audit log. It is also why the CLI
+  needs the app up.
 - **`/admin` and `/api/admin` answer 404, not 403,** to anyone who is not an admin. A "forbidden"
   tells whoever guessed the URL that there is something there worth attacking. The panel is linked
   in the nav for admins, so nobody who should be there has to guess.
@@ -347,99 +461,27 @@ The `--no-autoupdate` flag matters more here than in a sidecar: cloudflared's up
 its own binary and restarts itself, which inside a container is both futile and a restart nobody
 asked for. Bump the pinned version deliberately instead.
 
-## Hosting it in Azure
+## Hosting it in Azure — retired
 
-The public copy runs on **Azure Container Apps**, pulling that same GHCR image. Azure
-terminates TLS and hands out a stable hostname, which is why there is no tunnel any more:
+The public copy used to run on **Azure Container Apps**. It does not any more, and this section is
+a signpost rather than instructions.
 
-```
-https://packripper.<generated>.<region>.azurecontainerapps.io
-```
+Two things pushed it off. Container Apps costs $10–15 a month because always-on and consumption
+billing do not mix — the free grant is 180,000 vCPU-seconds, which at 0.5 vCPU is 100 hours, not a
+month. And the database had to live on an **Azure Files (SMB) share**, which is where every
+data-loss incident this project ever had came from: a share that had not attached yet is
+indistinguishable from a first-ever boot, SMB can refuse a rename onto an existing file, and a
+container killed mid-write left a torn 4 MB file that the next boot had to recover from. Roughly
+two thirds of the old `db.js` was machinery defending against exactly those three failures.
 
-The app itself is created and managed in the Portal — this repo does not script it. What the
-pipeline gives you is a fresh image in the registry; wiring it up is these settings:
+Moving to Postgres removed the class of problem, and moving to a Raspberry Pi removed the bill.
+See [Hosting it on a Raspberry Pi](#hosting-it-on-a-raspberry-pi), which is where the public copy
+runs now, or [Hosting it on Oracle Cloud](#hosting-it-on-oracle-cloud) for a free VM.
 
-| Portal field | Value |
-|---|---|
-| Image source | Docker Hub or other registries |
-| Registry login server | `ghcr.io` |
-| Authentication | Public — the package is public, no credentials |
-| Image and tag | `tahuffman1s/pack-ripper:sha-<short>` |
-| Ingress | Enabled, accepting traffic from anywhere |
-| Target port | **3000** |
-| CPU / memory | 0.5 / 1 GiB |
-| Min / max replicas | **1 / 1** |
-
-Port 3000 is consistent in all three places that matter: `EXPOSE 3000` and `ENV PORT=3000` in
-the Dockerfile, and the ingress target port. Azure serves 443 publicly and forwards to 3000.
-
-Four things the create form will not prompt for, each of which breaks something real:
-
-- **`ORIGIN` must be set** to `https://<the app's hostname>`, after creation once you know it.
-  SvelteKit refuses any POST whose `Origin` header disagrees with the origin it believes it is
-  serving, so a missing or wrong value does not break pages — it breaks every login and every
-  purchase while everything keeps looking fine. The rest of the environment is
-  `NODE_ENV=production`, `HOST=0.0.0.0`, `PORT=3000`, `BODY_SIZE_LIMIT=2M`, plus
-  `ADMIN_USERNAMES` and `ADMIN_TOKEN` if you want the [admin panel and CLI](#admin) — without the
-  first of those, the hosted copy has no admins and no way to appoint one.
-- **A volume mounted at `/app/.data`** (Azure Files). That is the entire database — accounts,
-  collections, wallets, the serial-number ledger. Without it, every revision and every restart
-  starts empty. **Adding it to one revision does not add it to the next**: the mount lives in the
-  revision template, so a revision created from a template that lacks it comes up with no volume
-  and no warning. Check it after every deploy — see below.
-- **Do not mount `.cache`.** It is ~100 MB of regenerated Scryfall, MTGJSON and TCGplayer data
-  with its own TTLs, read as thousands of small files, which is what SMB is worst at. Left on
-  local disk it costs a slow first minute after a deploy and is fast for every request after.
-- **Exactly one replica.** `db.js` keeps the database in memory and flushes it to a single
-  file, so a second replica would not see the first one's writes and would overwrite them.
-  Scaling this app means a real database first, not a bigger `maxReplicas`.
-
-A health probe on `/api/health` is worth adding, with a **startup** budget of about five
-minutes: a fresh revision has an empty `.cache`, and the first request fetches the Scryfall set
-list and probes ~55 sets for sealed prices before anything is served. A tighter budget makes
-the platform decide the container is broken and restart it in a loop.
-
-At 0.5 vCPU / 1 GiB always on, expect roughly $10–15 a month against your credits. Container
-Apps bills per second, so deleting the resource group genuinely stops the meter.
-
-### Checking that the database is actually mounted
-
-The single most expensive mistake here is a revision that comes up without its volume, because
-the app cannot tell that from a first-ever boot. It says which it thinks it is, on the first line
-of the log:
-
-```
-db: loaded 71 account(s) from /app/.data/db.json        ← mounted, data found
-db: no usable database at /app/.data/db.json — ...      ← nothing there
-```
-
-The second line on a deployment that should have accounts means **the volume is not mounted**.
-Nothing has been overwritten at that point — the app writes nothing at startup, and refuses to
-save over accounts it never loaded — so fixing the mount and restarting gets everything back.
-Anything created while it was in that state is lost, which is the smaller loss.
-
-The same thing is on the admin panel as a **Storage** card, which turns red in that state, and
-`./admin.sh status --url https://<hostname>` reports it without needing log access. Worth a look
-after every revision.
-
-If the file is ever damaged — a container killed mid-write on SMB can truncate it — the app
-recovers from `db.json.bak` or an orphaned `db.json.tmp` (a complete copy, written before the
-rename that never happened) and keeps the bad file as `db.json.corrupt-<timestamp>` rather than
-overwriting it. `ALLOW_DB_RESET=1` is the deliberate "yes, erase it" switch; without it the app
-would rather serve nothing than destroy accounts.
-
-### Shipping a new build
-
-The pipeline builds and pushes; it does not deploy. **Container Apps will not pull a new tag on
-its own** — even pushing a new `latest` leaves the running revision exactly where it is. To pick
-up a build: Container App → Revisions → *Create new revision*, change the tag, create.
-
-Each run's summary in Actions prints the registry, the `image:tag` and the port, formatted to be
-pasted straight into that form.
-
-Deploy the `sha-<short>` tag rather than `latest`. Both point at the same build, but with an
-immutable tag you can tell from the Portal which commit a revision is running, and a rollback is
-just creating a revision on an older tag — every one of them is still in the registry.
+If you do want Container Apps: the app needs a real Postgres, which on Azure means **Azure
+Database for PostgreSQL Flexible Server** (a burstable B1ms is roughly $13–25/month on top of the
+compute). Set `DATABASE_URL` to its connection string and `PGSSLMODE=no-verify` if its certificate
+chain is not one this image trusts. Do not put Postgres's data directory on an SMB share.
 
 ## Hosting it on Oracle Cloud
 
@@ -548,13 +590,15 @@ one line.
 - **Idle reclamation.** Always Free compute can be reclaimed after seven days of low utilisation,
   and a quiet hobby app qualifies. Upgrading the account to Pay As You Go exempts you and still
   bills $0 for always-free resources — this is the single change worth making.
-- **Backups.** `.data/db.json` is every account, collection and wallet, and now it is on one disk
-  you own. The app keeps a `.bak` beside it, which survives a bad write but not a lost instance.
-  A daily copy off the box:
+- **Backups.** The Postgres volume is every account, collection and wallet, and it is on one disk
+  you own. A daily dump off the box — `pg_dump`, not a tar of the data directory, so it restores
+  onto any Postgres including a newer major:
 
   ```
-  0 4 * * * tar czf ~/backups/db-$(date +\%F).tar.gz -C ~/Pack-Ripper/deploy/oracle .data
+  0 4 * * * docker exec packripper-db pg_dump -U packripper -d packripper --clean --if-exists | gzip -9 > ~/backups/db-$(date +\%F).sql.gz
   ```
+
+  To restore: `gzip -dc db-DATE.sql.gz | docker exec -i packripper-db psql -U packripper -d packripper`
 
   Oracle's own boot-volume backup policy (Storage → Block Volumes → the volume → Backups) covers
   the instance dying, and is a click.
@@ -605,6 +649,52 @@ the rest. On a Pi booting from an SD card it says so, points out any other disk 
 lets you choose — it will not mount or format anything, because picking the wrong disk is not a
 mistake a convenience script gets to make.
 
+### Updates, including the ones you are not there for
+
+Re-running the installer **is** the update, and it keeps everything: it reuses every answer in
+`.env`, pulls the published image, and recreates the containers on it. The database, the cache and
+`.env` are a bind mount, a bind mount and a file — `docker compose up -d` replaces containers, not
+volumes, and nothing here ever passes `-v` or `down`. To skip the questions and just move forward:
+
+```bash
+cd ~/Pack-Ripper/deploy/pi
+./install.sh --update
+```
+
+**And it keeps itself up to date.** The installer puts `deploy/pi/update.sh` on a systemd timer
+(`packripper-update.timer`, every 15 minutes by default), so a push to `main` is live on the Pi
+within about twenty minutes with nobody logged in. There is no webhook, because there is nothing
+for one to call: GHCR does not send them, and the whole point of the tunnel is that this Pi
+publishes no port. So it polls, which is one manifest request and costs nothing.
+
+The part that makes it safe to leave running is what happens after the swap. `update.sh` waits up
+to four minutes for the new container to answer `/api/health`; if it does not, it re-tags the
+previous image, brings that back, and writes the bad image ID to `.update-skip` so the next run
+does not walk into the same wall every quarter of an hour. **The site does not stay down waiting
+for you to notice.** A successful update then removes the image it replaced, which matters on a
+Pi — GHCR keeps every build, so going back is `TAG=sha-<short>` and one more run.
+
+Only the app is touched. `db` is never pulled: it is pinned to a Postgres major because a newer
+one will not read a data directory an older one wrote, and that is a change to make with a dump in
+hand, not on a timer.
+
+```bash
+./update.sh --check       # is there a new build? (it downloads it to be sure)
+./update.sh               # move to it now
+sudo systemctl list-timers packripper-update
+sudo journalctl -u packripper-update -n 30
+./install.sh --update-interval 2h        # look less often
+./install.sh --no-auto-update            # stop, and remove the timer
+```
+
+If backups are configured, `update.sh` takes one before the swap — a container swap does not touch
+data, but a new build can carry a schema change, and that is exactly when an hour-old dump off the
+Pi is worth having. A backup that fails is a loud warning, not a reason to stop updating forever.
+
+Changes to `compose.yml`, `install.sh` or `update.sh` do **not** arrive this way: the timer moves
+the image, not the checkout. `git pull` and re-run the installer for those. (The image build
+ignores `deploy/**` for the same reason, so editing a compose file does not rebuild anything.)
+
 ### Hourly backups to a Nextcloud
 
 `deploy/pi/backup.sh` tars `.data` and uploads it over WebDAV. The installer offers to set it up
@@ -622,8 +712,8 @@ lives in plain text in `.env`, and an app password can be revoked by itself. The
 the credentials work before it finishes and takes the first backup immediately — a backup that
 only fails at 3am is worse than none, because you believe you have one.
 
-**Retention needs no pruning.** Each run writes `db-hHH.tar.gz` for the current UTC hour, and the
-04:00 run also writes `db-dN.tar.gz` for the weekday. That is 24 hourly slots and 7 daily ones,
+**Retention needs no pruning.** Each run writes `db-hHH.sql.gz` for the current UTC hour, and the
+04:00 run also writes `db-dN.sql.gz` for the weekday. That is 24 hourly slots and 7 daily ones,
 each overwritten as it comes round again: the last day hour by hour, the last week day by day, 31
 files forever. The obvious alternative — timestamped names plus a prune step — needs PROPFIND and
 XML parsing to decide what to delete, and fails by silently filling the remote.
@@ -637,18 +727,24 @@ sudo systemctl list-timers packripper-backup
 sudo journalctl -u packripper-backup -n 20
 ```
 
-The unit runs as **root** deliberately: the container runs as root, so everything it writes into
-the bind-mounted `.data` is root-owned and an unprivileged unit could not read the database it is
-meant to be saving. No app downtime is needed either — `db.js` replaces `db.json` by `rename`, so
-`tar` sees either the old complete file or the new one, never half of one.
+Each slot is a **`pg_dump`**, not a tar of the data directory, for two reasons — and the second is
+the one that matters. A dump is SQL that any Postgres can restore, including a newer major on a
+machine you have just rebuilt, where a copy of `PGDATA` is readable only by the exact major that
+wrote it. And `pg_dump` runs in a single transaction against one consistent snapshot, where tarring
+a live data directory reads files over several seconds while the server writes to them and produces
+a torn copy that may not restore at all. (The old JSON database got away with `tar` only because it
+was replaced by `rename`, so `tar` saw one whole version or the other.)
 
-To restore, download a slot and unpack it over `.data`:
+The unit runs as **root**. The reason changed with the database but did not go away: `backup.sh` no
+longer reads root-owned files out of a bind mount, it runs `pg_dump` via `docker exec` — and access
+to the Docker socket is the same privilege by a different name.
+
+To restore, download a slot and replay it. The dump is `--clean --if-exists`, so it drops and
+recreates as it goes and needs no empty database to land in — and no downtime:
 
 ```bash
 cd ~/Pack-Ripper/deploy/pi
-sudo docker compose down
-tar xzf db-h14.tar.gz -C .data
-sudo docker compose up -d
+gzip -dc db-h14.sql.gz | sudo docker exec -i packripper-db psql -U packripper -d packripper
 ```
 
 The manual route still works and is four commands:
@@ -678,20 +774,23 @@ hours. If the domain is already on Cloudflare, there is nothing to do.
 Requirements are a **64-bit OS** (there is no armv7 build) and a Pi with 2 GB or more. A Pi 4 or 5
 is comfortable; a Zero 2 W is not.
 
-### The SD card problem, which is the real one
+### The SD card problem, which used to be the real one
 
-`db.js` keeps the database in memory and rewrites **the entire file** on every mutation. That is
-the right design for a single process and it is what makes the app dependency-free, but on a Pi it
-has a consequence worth arithmetic:
+This was the strongest argument for moving off the JSON file, and the arithmetic is worth keeping
+because it explains what changed:
 
-- `.data/db.json` is already **~4 MB**.
-- Every slot spin, every blackjack hit, every card sold is one full rewrite (debounced 60 ms, so
-  one action really is one write — `game.js` batches an opened box, but not a spin).
-- An hour of slots at a spin every two seconds is ~1,800 writes ≈ **7 GB**, all to one file.
+- `.data/db.json` was **~4 MB**, and every slot spin, blackjack hit and card sold rewrote all of
+  it (debounced 60 ms, so one action really was one write).
+- An hour of slots at a spin every two seconds is ~1,800 writes ≈ **7 GB**, all landing on the same
+  few flash blocks.
 
-SD cards have no wear-levelling worth relying on. **Point `DATA_DIR` at a USB SSD**, or boot the
-Pi from one — it is the single setting here that decides whether the storage lasts. `.cache` is
-gentler (it is written once per set and then read), but it may as well go on the same disk.
+Postgres writes the row that changed plus a WAL record, so the same hour is megabytes rather than
+gigabytes. The problem is not gone — steady small writes still wear a card, and WAL is its own
+write stream — but it is roughly three orders of magnitude smaller.
+
+**Point `DB_DIR` at a USB SSD anyway**, or boot the Pi from one. It is still the setting here that
+decides whether the storage lasts years instead of months, and `install.sh` offers it when it
+notices the Pi booted from `mmcblk`. `.cache` may as well go on the same disk.
 
 ### Two smaller things
 
@@ -706,8 +805,9 @@ gentler (it is written once per set and then read), but it may as well go on the
   Every later start reads the warm cache off disk and is quick.
 
 - **Uptime is your ISP's uptime**, and a power cut is a restart. `restart: unless-stopped` plus
-  Docker enabled at boot covers the reboot; the atomic write plus `db.json.bak` covers being
-  killed mid-flush. Back the file up off the Pi anyway — same cron as the Oracle section.
+  Docker enabled at boot covers the reboot, and being killed mid-write is now Postgres's problem
+  rather than this app's: a committed transaction is committed, and crash recovery replays the WAL
+  on the next start. Back it up off the Pi anyway — that is what the section above is for.
 
 ### What Railway would have cost
 
@@ -740,8 +840,12 @@ src/
       CardTile.svelte     a card face for grids
       BuyTile.svelte      one buyable product + its quantity control
     server/
-      db.js               file-backed JSON store (atomic writes)
-      auth.js             accounts, password hashing, sessions
+      db.js               Postgres pool, tx(), and the wallet/stats row locks
+      schema.js           the schema, as SQL — applied on every boot
+      rows.js             row <-> object mapping (cards, packs, openings)
+      economySql.js       the gold conversions in SQL, for aggregate queries
+      importJson.js       one-shot migration of a legacy .data/db.json
+      auth.js             accounts, password hashing, sessions + expiry sweep
       scryfall.js         Scryfall fetch + disk cache + print index
       mtgjson.js          MTGJSON transport (gzip, versioning)
       collation.js        per-set collation slice + sheet classification
@@ -802,13 +906,15 @@ deploy/
 - Card data is cached for 14 days under `.cache/`; collation slices for 90 days (collation
   never changes once a set is released). Delete `.cache/` to refresh.
 - Admin access is `ADMIN_USERNAMES` and `ADMIN_TOKEN`, both off when unset — see [Admin](#admin).
-- **Shutdown is bounded, deliberately.** On SIGTERM the database is flushed at once, and the
-  process leaves as soon as adapter-node reports the HTTP server drained (`sveltekit:shutdown`) —
-  typically ~100 ms. It does not wait for the background price warming, which on a cold cache
-  runs for minutes of fetches and throttle timers and used to hold the process open long past
-  any container's stop grace; that work produces nothing but regenerable `.cache`. If the drain
-  itself never completes, `SHUTDOWN_GRACE_MS` (default 8000) leaves anyway, and the image sets
-  adapter-node's own `SHUTDOWN_TIMEOUT=5` so a request that will not finish is closed first.
+- **Shutdown is bounded, deliberately.** On SIGTERM the process leaves as soon as adapter-node
+  reports the HTTP server drained (`sveltekit:shutdown`) — measured at ~100 ms, exit code 0. It does
+  not wait for the background price warming, which on a cold cache runs for minutes of fetches and
+  throttle timers and used to hold the process open long past any container's stop grace (measured:
+  still running 122 seconds after SIGTERM, so every stop ended in a SIGKILL); that work produces
+  nothing but regenerable `.cache`. If the drain never completes, `SHUTDOWN_GRACE_MS` (default 8000)
+  leaves anyway, and the image sets adapter-node's own `SHUTDOWN_TIMEOUT=5` so a request that will
+  not finish is closed first. This mattered enormously when a SIGKILL could interrupt a 4 MB write
+  to the one file holding every account; it now just means a deploy is quick.
 - **Vintage sealed prices depend on a computed floor.** A pre-2006 pack with no live TCGplayer
   listing is priced from the exact EV of its print sheets (`packvalue.js`), because the MSRP×age
   heuristic puts an Alpha booster at $43 against singles worth thousands. Those floors are warmed

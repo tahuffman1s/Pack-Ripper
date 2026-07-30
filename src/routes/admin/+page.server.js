@@ -12,13 +12,15 @@ import { PACK_TYPE_ORDER } from '$lib/packs.js';
  */
 
 /** @type {import('./$types').PageServerLoad} */
-export function load({ locals }) {
+export async function load({ locals }) {
 	if (!locals.user?.admin) throw error(404, 'Not found');
 
+	const [summaryData, users, log] = await Promise.all([summary(), listUsers(), auditLog(40)]);
+
 	return {
-		summary: summary(),
-		users: listUsers(),
-		log: auditLog(40),
+		summary: summaryData,
+		users,
+		log,
 		sets: grantableSets(),
 		packTypeOrder: PACK_TYPE_ORDER
 	};

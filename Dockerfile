@@ -2,10 +2,21 @@
 
 # PackRipper — SvelteKit on adapter-node.
 #
-# Two stages. The build stage needs the dev dependencies (vite, svelte,
-# tailwind); the runtime stage needs almost nothing, because adapter-node
-# bundles the entire server into build/ — its only imports are node: builtins.
-# No node_modules, no package.json, no native modules anywhere.
+# Three stages. The build stage needs the dev dependencies (vite, svelte,
+# tailwind); the deps stage resolves the runtime dependencies on their own so
+# neither one has to carry the other's; the runtime stage takes build/ and those.
+#
+# adapter-node bundles the entire server into build/, so the ONLY runtime
+# dependency is the Postgres driver — Vite deliberately leaves packages listed in
+# `dependencies` as external imports rather than bundling them, and `pg` reaches
+# for pgpass lazily besides. Enumerating its transitive tree in vite.config.js
+# would work today and break silently the next time pg adds a package, in
+# production only, since dev resolves from node_modules either way. 760 KB of
+# node_modules is the cheaper answer.
+#
+# Still no native modules: pg is pure JavaScript, and --omit=optional keeps
+# pg-native (the libpq binding) out. That is what preserves "runs anywhere Node
+# runs", which was the whole reason the database used to be a JSON file.
 
 # ── build ──────────────────────────────────────────────────────
 FROM node:22-alpine AS build
@@ -22,13 +33,21 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
+# ── runtime dependencies ───────────────────────────────────────
+# Its own stage, from the lockfile alone, so it is cached independently of the
+# source and shares nothing with the dev dependencies above.
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --omit=optional && npm cache clean --force
+
 # ── runtime ────────────────────────────────────────────────────
 FROM node:22-alpine AS runtime
 WORKDIR /app
 
-# curl is only here for HEALTHCHECK, which run.sh's startup wait also uses. The
-# Azure Container Apps probes hit /api/health over the network instead, so they
-# do not need it.
+# curl is only here for HEALTHCHECK, which run.sh's startup wait also uses, and
+# for warming a cold cache by hand on a Pi before Cloudflare's 100-second origin
+# timeout can turn the first request into a 524.
 RUN apk add --no-cache curl
 
 # The Cloudflare Tunnel client, so a host with no inbound port to open — a Pi
@@ -51,10 +70,11 @@ RUN apk add --no-cache curl
 COPY --from=docker.io/cloudflare/cloudflared:2026.7.3 /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 
 COPY --from=build /app/build ./build
+COPY --from=deps /app/node_modules ./node_modules
 
-# The admin CLI, for a host with no copy of the repo — the Azure console, above
-# all. A dependency-free script that talks to the app over loopback; it carries no
-# privileges of its own and does nothing without ADMIN_TOKEN set.
+# The admin CLI, for a host with no copy of the repo — a `docker exec` into a Pi,
+# above all. A dependency-free script that talks to the app over loopback; it
+# carries no privileges of its own and does nothing without ADMIN_TOKEN set.
 #
 # `admin` on the PATH because this is typed by hand in a web console, where
 # `node /app/admin.mjs gold someone 5000` is a lot to get right. The repo's
@@ -66,14 +86,18 @@ RUN ln -s /app/admin.mjs /usr/local/bin/admin
 
 COPY scripts/docker-entrypoint.sh scripts/docker-healthcheck.sh /usr/local/bin/
 
-# Bind-mounted by run.sh / compose; in Azure only .data is mounted, from a file
-# share. Declared anyway so an unmounted container still boots (it just starts
-# with an empty vault and a cold cache).
+# .cache is ~100 MB of regenerated Scryfall, MTGJSON and TCGplayer data. Losing
+# it costs a slow first minute, nothing more.
+#
+# .data no longer holds the database — that is Postgres now — and an empty one is
+# the normal steady state. It is still mounted for exactly one reason: a legacy
+# .data/db.json found there is imported into an empty database on first boot. See
+# importJson.js. Once the import has happened it can stop being mounted.
 RUN mkdir -p /app/.data /app/.cache
 VOLUME ["/app/.data", "/app/.cache"]
 
 # HOST=0.0.0.0 so the port is reachable from outside the container; adapter-node
-# otherwise binds loopback, and neither a published port nor Azure's ingress can
+# otherwise binds loopback, and neither a published port nor cloudflared can
 # reach it.
 # SHUTDOWN_TIMEOUT is adapter-node's, in seconds: how long a stopping server
 # waits for a request that will not finish before it closes the connection

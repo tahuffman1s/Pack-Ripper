@@ -3,13 +3,14 @@
  * PackRipper admin CLI.
  *
  * Talks to a *running* app over HTTP and authenticates with the shared secret in
- * ADMIN_TOKEN. It deliberately does not touch .data/db.json: db.js holds the whole
- * database in memory and writes all of it back on every mutation, so a second
- * process editing that file would have its work silently overwritten by the next
- * thing any player did. Going through the app is the only way a change sticks.
+ * ADMIN_TOKEN. It deliberately does not connect to Postgres directly. It could —
+ * the old reason it could not (the app held everything in memory and would
+ * overwrite any outside edit) is gone — but going through the app means this needs
+ * no database credentials, gets the same validation as the panel, and lands every
+ * action in the same audit log.
  *
  * Run it from the repo on the host, or from inside the container, where the image
- * puts it on the PATH as `admin` — that one is typed by hand in the Azure console,
+ * puts it on the PATH as `admin` — that one is typed by hand in a remote shell,
  * so it is worth being short:
  *
  *   ./admin.sh gold travis 50000
@@ -34,7 +35,7 @@ import { userInfo } from 'node:os';
 
 /**
  * How to spell this command back at whoever ran it. Inside the container the repo
- * wrapper does not exist — telling someone in the Azure console to run
+ * wrapper does not exist — telling someone in a `docker exec` shell to run
  * `./admin.sh` sends them looking for a file that is not there.
  *
  * The image copies this script to a fixed path, which is what makes the test
@@ -100,7 +101,7 @@ for (let i = 0; i < argv.length; i++) {
 const command = args.shift() || 'help';
 
 // Deliberately NOT falling back to ORIGIN. That variable is how *browsers* reach
-// the app — in Azure a public https:// hostname — and inside the container it is
+// the app — in production a public https:// hostname — and inside the container it is
 // not reachable from loopback at all. A local process always finds the app on
 // 127.0.0.1:$PORT; anything else is a remote app and says so with --url.
 const BASE = String(
@@ -349,32 +350,35 @@ async function cmdStatus() {
 	console.log(`  cards         ${num(summary.cards)} owned, ${num(summary.serialsIssued)} serials issued`);
 	console.log(`  packs         ${num(summary.packs)} unopened, ${num(summary.tablesOpen)} table(s) in play`);
 
-	// The line that matters after a deploy: a volume that is not mounted looks
-	// exactly like a first boot to the app, and only it knows which it decided.
+	// Whether the app is talking to its database, and to which one. This used to be
+	// the most important line after a deploy, because a share that had not mounted
+	// looked exactly like a first boot to the app and only it knew which it had
+	// decided; Postgres does not have that failure mode, so it is now just status.
 	const st = summary.storage;
 	if (st) {
-		const state = st.startedEmpty
-			? `${c.r}STARTED EMPTY${c.n}`
-			: st.recoveredFrom
-				? `${c.y}recovered${c.n}`
-				: `${c.g}loaded${c.n}`;
-		console.log(`  database      ${state}  ${st.path}`);
+		const state = !st.ready ? `${c.r}NOT CONNECTED${c.n}` : st.error ? `${c.y}degraded${c.n}` : `${c.g}connected${c.n}`;
+		console.log(`  database      ${state}  ${st.serverVersion || 'postgres'}`);
 		console.log(
-			`                ${num(st.usersAtLoad)} account(s) at load` +
-				(st.bytes != null ? `, ${Math.round(st.bytes / 1024)} KB` : '') +
-				`, backup ${st.hasBackup ? 'present' : 'not yet written'}`
+			`                ${st.database || '?'}${st.host ? ` @ ${st.host}` : ''}` +
+				`, ${num(st.usersAtBoot)} account(s) at boot` +
+				(st.bytes != null ? `, ${(st.bytes / 1024 / 1024).toFixed(1)} MB` : '')
 		);
-		if (st.startedEmpty) {
+		if (st.pool) {
 			console.log(
-				`  ${c.y}!${c.n}             no database was found. If this deployment had accounts, the`
+				`                pool ${st.pool.total} open, ${st.pool.idle} idle` +
+					(st.pool.waiting ? `, ${c.y}${st.pool.waiting} waiting${c.n}` : '')
 			);
-			console.log('                volume is not mounted — nothing has been overwritten yet.');
 		}
-		if (st.recoveredFrom) console.log(`  ${c.y}!${c.n}             bad file kept at ${st.recoveredFrom}`);
-		if (st.refusedWrites) {
-			console.log(`  ${c.r}!${c.n}             ${st.refusedWrites} write(s) refused to protect existing accounts`);
+		if (!st.ready) {
+			console.log(`  ${c.r}!${c.n}             check DATABASE_URL and that the db container is up`);
 		}
-		if (st.allowReset) console.log(`  ${c.y}!${c.n}             ALLOW_DB_RESET=1 is set`);
+		if (st.error) console.log(`  ${c.y}!${c.n}             last error: ${st.error}`);
+		if (st.imported) {
+			console.log(
+				`  ${c.g}+${c.n}             imported ${num(st.imported.inDatabase?.users ?? 0)} account(s) / ` +
+					`${num(st.imported.inDatabase?.cards ?? 0)} card(s) from ${st.imported.source} on this boot`
+			);
+		}
 	}
 	if (summary.envAdmins.length) console.log(`  ADMIN_USERNAMES  ${summary.envAdmins.join(', ')}`);
 	if (log?.length) {
@@ -386,9 +390,9 @@ function cmdToken() {
 	const token = randomBytes(32).toString('base64url');
 	console.log(token);
 	if (tty) {
-		info('\n  Put this in both places, then restart the container:');
+		info('\n  Put this in .env where the app reads it, then restart the container:');
 		info(`    .env                ADMIN_TOKEN=${token}`);
-		info('    Azure Portal        Container App → Containers → environment variables');
+		info('    on a server         deploy/<host>/.env, then: docker compose up -d');
 	}
 }
 

@@ -1,392 +1,334 @@
-import {
-	existsSync,
-	mkdirSync,
-	readFileSync,
-	writeFileSync,
-	renameSync,
-	unlinkSync,
-	copyFileSync,
-	statSync
-} from 'node:fs';
-import { dirname, join } from 'node:path';
+import pg from 'pg';
+import { randomBytes } from 'node:crypto';
+import { SCHEMA_SQL } from './schema.js';
 
 /**
- * Tiny file-backed JSON "database".
+ * Postgres, via a connection pool.
  *
- * Chosen over better-sqlite3 so the app has ZERO native build dependencies and
- * runs anywhere Node runs. Everything is kept in memory and flushed to disk
- * atomically (write temp + rename) on every mutation. Fine for a single-process
- * simulator; not meant for high concurrency.
+ * This replaced a file-backed JSON database, and the reason was not scale — 71
+ * accounts is nothing. It was that the old design rewrote the ENTIRE database on
+ * every mutation: every slot spin, every blackjack hit, every card sold flushed
+ * megabytes. That cost grew with the size of the whole server rather than with
+ * the size of the change, it wore out SD cards on the Pi, and about two thirds of
+ * the old db.js was machinery defending a single 4 MB file against torn writes,
+ * unmounted volumes and SMB rename semantics. None of that code exists any more,
+ * because none of those failures are the application's to survive.
  *
- * The rest of this file is mostly about not destroying that one file. It holds
- * every account, so the worst thing it can do is not "lose a write" — it is
- * "write an empty database over a full one", and there were three ways to get
- * there. Each is now blocked, and none of them relied on noticing in time:
+ * What replaced it needs one thing said clearly, because it is the one real
+ * hazard the change introduced:
  *
- *  1. A missing db.json used to be created immediately, empty. On Azure .data is
- *     an SMB mount, and a mount that is not attached yet looks exactly like a
- *     first-ever boot — so the app wrote an empty database onto the share and the
- *     real one was gone. Nothing is written now until a real mutation happens.
- *  2. An unreadable db.json used to be replaced by an empty one, which also
- *     destroyed the evidence. It is now moved aside, kept, and recovered from.
- *  3. The SMB fallback below writes in place, non-atomically. A container killed
- *     mid-write — which is what a new revision does to the old one — left a torn
- *     file, and the next boot hit path 2. There is now a complete second copy to
- *     fall back on, and the torn file is never mistaken for the truth.
+ *   The old data layer was SYNCHRONOUS, and that made every read-then-write
+ *   atomic for free. `if (wallet.gold < cost) return; ... wallet.gold -= cost`
+ *   could not interleave with another request, because Node runs one thing at a
+ *   time and there was no await between the test and the write. Every one of
+ *   those sequences now has an await in the middle, so two requests from the same
+ *   player CAN interleave, and a balance check that passes twice would let the
+ *   same gold be spent twice.
+ *
+ * So every path that moves money takes a row lock on the wallet FIRST, inside the
+ * transaction, and does its arithmetic after. That is what lockGold() is for, and
+ * it is not optional on those paths — it is what restores the guarantee the
+ * synchronous version had by accident.
  */
-
-const DATA_DIR = join(process.cwd(), '.data');
-const DB_PATH = join(DATA_DIR, 'db.json');
-const BAK_PATH = DB_PATH + '.bak';
-const TMP_PATH = DB_PATH + '.tmp';
-
-/** Escape hatch: set to deliberately start over on a share that has data. */
-const ALLOW_RESET = process.env.ALLOW_DB_RESET === '1';
-
-/** How often to refresh the backup copy. Every flush would double SMB writes. */
-const BACKUP_EVERY_MS = 1000 * 60 * 5;
 
 /**
- * How long a shutdown may take before this process stops being polite about it.
- * Under a container's ten-second stop grace, so the exit is ours rather than a
- * SIGKILL; see installShutdownFlush.
- *
- * Anything unparseable falls back rather than becoming NaN, which setTimeout
- * would treat as "now" — turning a typo into a shutdown that abandons in-flight
- * requests.
+ * int8 comes back from pg as a STRING by default, because a 64-bit integer does
+ * not always fit a JS number. Everything stored as bigint here is either an epoch
+ * millisecond timestamp or a gold balance capped at 1e12 by admin.js — both far
+ * below 2^53, so the conversion is exact and every consumer gets the number it
+ * already expects. Without this, gold arrives as "500" and `gold - cost` is NaN.
  */
-const SHUTDOWN_GRACE_MS =
-	Number(process.env.SHUTDOWN_GRACE_MS) > 0 ? Number(process.env.SHUTDOWN_GRACE_MS) : 8000;
+pg.types.setTypeParser(pg.types.builtins.INT8, (v) => (v === null ? null : Number(v)));
 
-const DEFAULT_DB = {
-	users: {}, // id -> { id, username, passwordHash, salt, createdAt, admin? }
-	usernames: {}, // lowercased username -> userId
-	sessions: {}, // token -> { userId, createdAt }
-	wallets: {}, // userId -> { gold }
-	inventory: {}, // userId -> [ { id, setCode, packTypeId, acquiredAt } ]  (unopened packs)
-	collections: {}, // userId -> [ cardInstance ]
-	stats: {}, // userId -> stats object
-	openings: {}, // userId -> [ recent opening summaries ]
-	serials: {}, // scryfallId -> [ issued serial numbers ]  (a 1/1 exists once, globally)
-	freeSpins: {}, // userId -> { remaining, lineBet, lines }  (slot bonus round)
-	blackjack: {}, // userId -> { shoe, phase, dealer, hands, active }  (table in play)
-	adminLog: [] // newest-first audit trail of admin actions (capped)
-};
+/**
+ * Where the database is. DATABASE_URL is the whole configuration; with it unset,
+ * node-postgres falls back to the standard PGHOST/PGUSER/PGDATABASE variables,
+ * which is what makes `psql`-style environments work unchanged.
+ */
+const CONNECTION_STRING = process.env.DATABASE_URL || undefined;
 
-let db = null;
-let flushTimer = null;
-let lastBackupAt = 0;
+/**
+ * Azure and other managed providers require TLS and present a certificate this
+ * app has no CA bundle for; `sslmode=require` in the URL is honoured by pg but
+ * still verifies. PGSSLMODE=no-verify is the documented escape hatch for that,
+ * and is only reachable by explicitly setting it.
+ */
+const ssl =
+	process.env.PGSSLMODE === 'no-verify' ? { rejectUnauthorized: false } : undefined;
 
-/** What happened at load, for the startup log and the admin panel. */
-let status = { loadedFrom: null, users: 0, startedEmpty: false, recovered: null, refusals: 0 };
+const pool = new pg.Pool({
+	connectionString: CONNECTION_STRING,
+	ssl,
+	// A Pi does not want thirty backends, and this app is one process serving one
+	// small player base. Ten is plenty and leaves headroom under Postgres's
+	// default max_connections of 100 for psql and pg_dump.
+	max: Number(process.env.PGPOOL_MAX) > 0 ? Number(process.env.PGPOOL_MAX) : 10,
+	idleTimeoutMillis: 30_000,
+	// Fail a request rather than hanging it forever if the pool is exhausted by a
+	// leak. A hung request looks like the app is broken; an error says which.
+	connectionTimeoutMillis: 10_000
+});
 
-const userCount = (o) => Object.keys(o?.users || {}).length;
+/**
+ * An idle client whose backend dies (Postgres restarted, network dropped) emits
+ * 'error' on the POOL, and an unhandled 'error' event on an EventEmitter takes
+ * the process down. Logging it lets the pool discard that client and hand the
+ * next request a fresh one, which is the behaviour that survives a `docker
+ * compose restart db`.
+ */
+pool.on('error', (e) => {
+	console.error('db: idle client error —', e.message);
+});
 
-/** Parse one candidate file. Returns null if it is absent or not usable. */
-function readSnapshot(path) {
-	if (!existsSync(path)) return null;
-	try {
-		const parsed = JSON.parse(readFileSync(path, 'utf-8'));
-		// A JSON file that parses but has no users map is not a database — most
-		// likely a half-written one that happened to land on valid syntax.
-		if (!parsed || typeof parsed !== 'object' || !parsed.users) return null;
-		return parsed;
-	} catch (e) {
-		console.error(`db: ${path} is unreadable — ${e.message}`);
-		return null;
-	}
+/** What happened at startup, for the boot log and the admin panel. */
+let status = { ready: false, error: null, usersAtBoot: 0, serverVersion: null, imported: null };
+
+/**
+ * Run one statement outside a transaction. For single reads and single writes;
+ * anything that reads a value and then writes based on it belongs in tx().
+ */
+export async function query(text, params) {
+	return pool.query(text, params);
 }
 
-/** Keep a bad file instead of overwriting it. Nothing here is worth losing twice. */
-function setAside(path) {
-	if (!existsSync(path)) return null;
-	const kept = `${path}.corrupt-${Date.now()}`;
+/**
+ * Run `fn` inside a transaction, passing it the dedicated client. Commits on
+ * return, rolls back on throw, and always gives the connection back.
+ *
+ * The client MUST be used for every statement inside — reaching for the exported
+ * query() in here would run that statement on a different connection, outside the
+ * transaction, and it would neither see the uncommitted work nor be rolled back
+ * with it.
+ */
+export async function tx(fn) {
+	const client = await pool.connect();
 	try {
-		renameSync(path, kept);
-		return kept;
-	} catch {
+		await client.query('BEGIN');
+		const result = await fn(client);
+		await client.query('COMMIT');
+		return result;
+	} catch (e) {
 		try {
-			copyFileSync(path, kept);
-			return kept;
-		} catch {
-			return null;
+			await client.query('ROLLBACK');
+		} catch (rollbackError) {
+			// The connection is already unusable; the original error is the useful one.
+			console.error('db: rollback failed —', rollbackError.message);
 		}
+		throw e;
+	} finally {
+		client.release();
 	}
-}
-
-function ensureLoaded() {
-	if (db) return db;
-	if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-
-	// In preference order. db.json.tmp is a real candidate, not debris: it is
-	// written in full before the rename, so if the rename never happened it is the
-	// newest complete copy that exists.
-	const primary = readSnapshot(DB_PATH);
-	if (primary) {
-		db = { ...structuredClone(DEFAULT_DB), ...primary };
-		status = { ...status, loadedFrom: DB_PATH, users: userCount(db), startedEmpty: false };
-	} else {
-		const kept = existsSync(DB_PATH) ? setAside(DB_PATH) : null;
-		const fallback =
-			[
-				[BAK_PATH, readSnapshot(BAK_PATH)],
-				[TMP_PATH, readSnapshot(TMP_PATH)]
-			].find(([, v]) => v) || null;
-
-		if (fallback) {
-			db = { ...structuredClone(DEFAULT_DB), ...fallback[1] };
-			status = {
-				...status,
-				loadedFrom: fallback[0],
-				users: userCount(db),
-				startedEmpty: false,
-				recovered: kept
-			};
-			console.error(
-				`db: RECOVERED ${status.users} account(s) from ${fallback[0]}.` +
-					(kept ? ` The unusable file was kept at ${kept}.` : '')
-			);
-		} else {
-			// Nothing readable anywhere. Start empty IN MEMORY ONLY — see note 1 at
-			// the top. A not-yet-attached mount is indistinguishable from a first
-			// boot, and only one of those two should ever write.
-			db = structuredClone(DEFAULT_DB);
-			status = { ...status, loadedFrom: null, users: 0, startedEmpty: true, recovered: kept };
-			console.error(
-				`db: no usable database at ${DB_PATH} — starting empty. ` +
-					'Nothing will be written until something actually changes. If this is a ' +
-					'restart rather than a first run, the volume is probably not mounted.'
-			);
-		}
-	}
-
-	if (status.loadedFrom) {
-		console.log(`db: loaded ${status.users} account(s) from ${status.loadedFrom}`);
-	}
-	return db;
 }
 
 /**
- * Refuse to overwrite accounts this process has never seen.
+ * Read a wallet balance and hold the row until the transaction ends.
  *
- * Only a process that failed to load a database can be about to do this; once we
- * have read one, our copy is the authority and this never fires. The test is
- * per-account rather than "is memory empty", because the sequence that actually
- * loses data is: boot with the volume unattached, the share appears, someone
- * registers — and by then memory holds one account, which an emptiness check
- * reads as a legitimate database worth saving. It is not. It is missing 71 others.
+ * This is the lock described at the top of the file, and every path that spends
+ * or pays out gold must call it before deciding whether the player can afford
+ * something. Two concurrent spins now queue behind each other instead of both
+ * reading the same balance.
  *
- * Set ALLOW_DB_RESET=1 to start over deliberately.
+ * Returns null when there is no wallet row, which callers report as an error
+ * rather than treating as a zero balance.
  */
-let diskSig = null;
-let diskVerdict = false;
-
-function wouldDestroyData() {
-	if (ALLOW_RESET) return false;
-	if (!status.startedEmpty) return false;
-
-	// One stat per flush instead of a read-and-parse, since this runs for the life
-	// of a process that started empty and the answer only changes when the file does.
-	let sig = 'none';
-	try {
-		const s = statSync(DB_PATH);
-		sig = `${s.size}:${s.mtimeMs}`;
-	} catch {
-		sig = 'none';
-	}
-	if (sig === diskSig) return diskVerdict;
-	diskSig = sig;
-
-	const onDisk = readSnapshot(DB_PATH) || readSnapshot(BAK_PATH);
-	if (!onDisk) {
-		diskVerdict = false;
-		return false;
-	}
-	const mine = new Set(Object.keys(db.users || {}));
-	diskVerdict = Object.keys(onDisk.users || {}).some((id) => !mine.has(id));
-	return diskVerdict;
+export async function lockGold(client, userId) {
+	const { rows } = await client.query(
+		'SELECT gold FROM wallets WHERE user_id = $1 FOR UPDATE',
+		[userId]
+	);
+	return rows.length ? rows[0].gold : null;
 }
 
-/** Second complete copy, refreshed on a timer rather than on every write. */
-function refreshBackup(now) {
-	if (now - lastBackupAt < BACKUP_EVERY_MS) return;
-	if (!existsSync(DB_PATH)) return;
-	try {
-		// Only from a file that currently parses — a backup of a torn file is worse
-		// than no backup, because it is the thing recovery trusts.
-		if (!readSnapshot(DB_PATH)) return;
-		copyFileSync(DB_PATH, BAK_PATH);
-		lastBackupAt = now;
-	} catch (e) {
-		console.error('db: backup copy failed:', e.message);
-	}
+/** Set a wallet to an exact value. Only ever called with a locked, computed balance. */
+export async function setGold(client, userId, gold) {
+	await client.query('UPDATE wallets SET gold = $2 WHERE user_id = $1', [userId, gold]);
 }
 
-function flushNow() {
-	if (!db) return;
-	if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-
-	if (wouldDestroyData()) {
-		status.refusals++;
-		console.error(
-			'db: REFUSING to save — the file on disk holds accounts this process never ' +
-				'loaded, so writing would erase them. The volume was almost certainly not ' +
-				'mounted at startup. Restart with it attached (anything created since this ' +
-				'process started will be lost, which is the smaller loss). Set ALLOW_DB_RESET=1 ' +
-				'only if you mean to erase what is there.'
-		);
-		return;
-	}
-
-	const now = Date.now();
-	refreshBackup(now);
-
-	const json = JSON.stringify(db, null, '\t');
-	writeFileSync(TMP_PATH, json);
-	try {
-		renameSync(TMP_PATH, DB_PATH);
-		return;
-	} catch (e) {
-		console.error('db: atomic rename failed:', e.message);
-	}
-
-	// Azure Files (SMB) can refuse a rename ONTO an existing file while allowing a
-	// rename to a free name. Clearing the target first keeps the write atomic,
-	// which the in-place path below does not.
-	try {
-		unlinkSync(DB_PATH);
-		renameSync(TMP_PATH, DB_PATH);
-		return;
-	} catch (e) {
-		console.error('db: unlink-then-rename failed:', e.message);
-	}
-
-	// Last resort. Truncates and rewrites in place, so a process killed here leaves
-	// a torn file — which is why db.json.tmp is deliberately left behind as a
-	// complete copy for the next boot to recover from.
-	try {
-		writeFileSync(DB_PATH, json);
-	} catch (e) {
-		console.error('db: in-place write failed, database NOT saved:', e.message);
-	}
+/**
+ * Read a player's stats blob and hold the row until the transaction ends.
+ *
+ * Stats stay one jsonb document, and the update stays a whole-object
+ * read-modify-write, because that is what the counters need: `bestPull` is a
+ * comparison against the current best, `bySet` is a map keyed by set code, and
+ * every game mode adds fields. Expressing those as in-place jsonb arithmetic
+ * would be a different piece of SQL per counter for no benefit, so the lock is
+ * what makes the read-modify-write safe instead.
+ *
+ * The no-op `DO UPDATE SET data = stats.data` is the point of the upsert: it
+ * creates the row if it is missing, takes the row lock either way, and returns
+ * the current value, in one round trip. A plain SELECT ... FOR UPDATE cannot lock
+ * a row that does not exist yet.
+ */
+export async function lockStats(client, userId) {
+	const { rows } = await client.query(
+		`INSERT INTO stats (user_id, data) VALUES ($1, '{}'::jsonb)
+		 ON CONFLICT (user_id) DO UPDATE SET data = stats.data
+		 RETURNING data`,
+		[userId]
+	);
+	return rows[0].data || {};
 }
 
-/** Debounced persistence so bursts of writes don't thrash the disk. */
-export function persist() {
-	if (flushTimer) return;
-	flushTimer = setTimeout(() => {
-		flushTimer = null;
+/** Write a stats blob back. Pairs with lockStats inside one transaction. */
+export async function writeStats(client, userId, data) {
+	await client.query('UPDATE stats SET data = $2::jsonb WHERE user_id = $1', [
+		userId,
+		JSON.stringify(data)
+	]);
+}
+
+/** Read a stats blob without locking, for display. Returns {} when there is no row. */
+export async function readStats(userId) {
+	const { rows } = await pool.query('SELECT data FROM stats WHERE user_id = $1', [userId]);
+	return rows[0]?.data || {};
+}
+
+/**
+ * Bring the database up: connect, apply the schema, report what is there.
+ *
+ * Called with top-level await from hooks.server.js so it is guaranteed to have
+ * finished before the first request is served — a request that arrived against a
+ * schema-less database would fail in a way that looks like a code bug.
+ *
+ * The retry loop is for compose ordering. `depends_on: service_healthy` covers it
+ * in the files here, but a Pi restarting both containers at boot is slow enough
+ * that being tolerant is cheaper than being right about the ordering everywhere.
+ */
+export async function initDb({ retries = 30, delayMs = 1000 } = {}) {
+	let lastError = null;
+
+	for (let attempt = 1; attempt <= retries; attempt++) {
 		try {
-			flushNow();
+			const { rows } = await pool.query('SELECT version() AS v, current_database() AS db');
+			status.serverVersion = rows[0].v.split(' ').slice(0, 2).join(' ');
+
+			// The entire migration story. Every statement is IF NOT EXISTS, so this is
+			// a no-op against a database that already has the schema, and it means a
+			// fresh volume needs no separate setup step.
+			await pool.query(SCHEMA_SQL);
+
+			const { rows: counted } = await pool.query('SELECT count(*)::int AS n FROM users');
+			status.usersAtBoot = counted[0].n;
+			status.ready = true;
+			status.error = null;
+
+			console.log(
+				`db: ${status.serverVersion} on "${rows[0].db}" — ${status.usersAtBoot} account(s)`
+			);
+			return status;
 		} catch (e) {
-			console.error('DB flush failed:', e);
+			lastError = e;
+			status.error = e.message;
+			if (attempt < retries) {
+				console.error(
+					`db: not ready (${e.message}) — retrying in ${delayMs}ms [${attempt}/${retries}]`
+				);
+				await new Promise((r) => setTimeout(r, delayMs));
+			}
 		}
-	}, 60);
+	}
+
+	// Nothing this app does works without the database, so there is no degraded
+	// mode worth booting into. Exiting lets the container's restart policy retry
+	// with a clean process instead of serving errors that look like bugs.
+	console.error(
+		`db: could not reach Postgres after ${retries} attempts — ${lastError?.message}. ` +
+			'Check DATABASE_URL and that the db service is up.'
+	);
+	throw lastError;
 }
 
-/**
- * Flush right now, skipping the debounce. Called when the process is going away:
- * a new Azure revision stops the old container, and a pending 60ms timer does not
- * survive that.
- */
-export function flushSync() {
-	if (flushTimer) {
-		clearTimeout(flushTimer);
-		flushTimer = null;
-	}
+/** Where the data lives and whether anything looked wrong. For /admin. */
+export async function dbStatus() {
+	const out = {
+		kind: 'postgres',
+		ready: status.ready,
+		error: status.error,
+		serverVersion: status.serverVersion,
+		usersAtBoot: status.usersAtBoot,
+		imported: status.imported,
+		pool: { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount },
+		database: null,
+		host: null,
+		bytes: null
+	};
+
 	try {
-		flushNow();
+		const { rows } = await pool.query(
+			`SELECT current_database() AS db,
+			        inet_server_addr()::text AS host,
+			        pg_database_size(current_database()) AS bytes`
+		);
+		out.database = rows[0].db;
+		// Null over a unix socket, which is not an error — just not an address.
+		out.host = rows[0].host || 'local';
+		out.bytes = Number(rows[0].bytes);
 	} catch (e) {
-		console.error('DB final flush failed:', e);
+		out.error = out.error || e.message;
 	}
+
+	return out;
+}
+
+/** Record what an import did, so the admin panel can show it. */
+export function noteImport(summary) {
+	status.imported = summary;
 }
 
 let hooked = false;
 /**
- * Persist on shutdown, and make sure the shutdown actually finishes. Idempotent,
- * so importing this twice is harmless.
+ * Make sure the process actually exits, and close the pool on the way out.
  *
- * Flushing on the signal is the easy half. The half that was broken is that the
- * process did not exit at all. adapter-node's own SIGTERM handler closes the HTTP
- * server and then simply expects the event loop to empty — and this app's does
- * not. Startup fires warmSealed() and warmVintageEv() into the background, and on
- * a cold cache those spend minutes on outbound fetches and throttle timers, every
- * one of which holds the process open. Measured: still running 122 seconds after
- * SIGTERM. So every container stop ended in a SIGKILL, and the only reason the
- * database survived that is that the flush below is synchronous.
+ * The exiting half of this predates Postgres and is unrelated to it. adapter-node
+ * closes the HTTP server on SIGTERM and then expects the event loop to empty —
+ * and this app's does not. Startup fires warmSealed() and warmVintageEv() into
+ * the background, and on a cold cache those spend minutes on outbound fetches and
+ * throttle timers, every one of which holds the process open. Measured: still
+ * running 122 seconds after SIGTERM. So every container stop ended in a SIGKILL.
  *
- * Hence the two exits. `sveltekit:shutdown` is emitted by adapter-node from its
- * httpServer.close() callback, which is precisely the moment when waiting longer
- * buys nothing: in-flight requests have finished, and what is left is background
- * work whose only product is regenerable cache. The timer is the backstop for
- * that event never arriving — unref'd, so it can never hold up a process that was
- * ready to leave on its own, which is exactly what an unref'd timer is for.
+ * That mattered enormously when a SIGKILL could interrupt a 4 MB write to the one
+ * file holding every account. It matters much less now — a committed transaction
+ * is committed, and Postgres is a different process that was not signalled — but
+ * a container that takes two minutes to stop is still a container that takes two
+ * minutes to deploy, so the two exits stay.
  *
- * Neither exit path flushes on its own, because process.exit() runs the `exit`
- * listener below and that is one 4 MB write, not two. `exit` rather than
- * `beforeExit` is what catches an explicit exit; both are registered because
- * `beforeExit` is the one that catches a loop that empties by itself.
+ * `sveltekit:shutdown` is emitted by adapter-node from its httpServer.close()
+ * callback, which is the moment when waiting longer buys nothing: in-flight
+ * requests have finished and what remains is background work whose only product
+ * is regenerable cache. The timer is the backstop for that event never arriving —
+ * unref'd, so it can never hold up a process that was ready to leave on its own.
  */
-export function installShutdownFlush() {
+export function installShutdownHandler() {
 	if (hooked) return;
 	hooked = true;
 
-	const leave = (why) => {
-		console.log(`db: ${why} — exiting`);
+	const grace = Number(process.env.SHUTDOWN_GRACE_MS) > 0 ? Number(process.env.SHUTDOWN_GRACE_MS) : 8000;
+
+	let leaving = false;
+	const leave = async (why) => {
+		if (leaving) return;
+		leaving = true;
+		console.log(`db: ${why} — closing pool and exiting`);
+		// Give in-flight transactions a moment to commit, but never block the exit
+		// on them: end() waits for every client to be released, and a leaked client
+		// would hang the shutdown forever.
+		await Promise.race([pool.end().catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
 		process.exit(0);
 	};
 
 	for (const sig of ['SIGTERM', 'SIGINT']) {
 		process.on(sig, () => {
-			console.log(`db: ${sig} — flushing`);
-			flushSync();
-			setTimeout(() => leave('shutdown took too long'), SHUTDOWN_GRACE_MS).unref();
+			console.log(`db: ${sig} — draining`);
+			setTimeout(() => leave('shutdown took too long'), grace).unref();
 		});
 	}
 	process.on('sveltekit:shutdown', () => leave('server drained'));
-
-	process.on('exit', flushSync);
-	process.on('beforeExit', flushSync);
-}
-
-/** Where the data came from and whether anything looked wrong. For /admin. */
-export function dbStatus() {
-	ensureLoaded();
-	let bytes = null;
-	try {
-		bytes = statSync(DB_PATH).size;
-	} catch {
-		bytes = null;
-	}
-	return {
-		path: DB_PATH,
-		loadedFrom: status.loadedFrom,
-		startedEmpty: status.startedEmpty,
-		recoveredFrom: status.recovered,
-		refusedWrites: status.refusals,
-		usersAtLoad: status.users,
-		bytes,
-		hasBackup: existsSync(BAK_PATH),
-		allowReset: ALLOW_RESET
-	};
-}
-
-export function getDb() {
-	return ensureLoaded();
-}
-
-/** Run a mutation against the db and persist. */
-export function mutate(fn) {
-	const d = ensureLoaded();
-	const result = fn(d);
-	persist();
-	return result;
 }
 
 export function makeId() {
-	return (
-		Date.now().toString(36) +
-		Math.random().toString(36).slice(2, 10) +
-		Math.random().toString(36).slice(2, 6)
-	);
+	// 12 bytes of CSPRNG rather than Date.now() plus two Math.random() slices. Card
+	// uids and inventory ids are primary keys now, so a collision is a constraint
+	// violation in someone's face rather than a silently overwritten object, and
+	// session tokens were the only thing here that was ever unguessable.
+	return randomBytes(12).toString('base64url');
 }

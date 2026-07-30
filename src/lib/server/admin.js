@@ -6,34 +6,29 @@
  * through POST /api/admin, so a command and a button do exactly the same thing
  * and there is one place to audit.
  *
- * The CLI deliberately talks HTTP rather than editing .data/db.json. db.js keeps
- * the whole database in memory and writes all of it back on every mutation, so a
- * second process editing the file would have its work silently overwritten by
- * the next thing a player did. Going through the running app is the only way a
- * change sticks.
+ * The CLI talks HTTP rather than connecting to Postgres directly. That is now a
+ * choice rather than a necessity — it used to be the only way a change could
+ * stick, because the app held the whole database in memory and would overwrite
+ * any outside edit — and it is still the right one: it means the CLI needs no
+ * database credentials, gets the same validation as the panel, and lands in the
+ * same audit log.
  */
 
 import { timingSafeEqual } from 'node:crypto';
-import { getDb, mutate, makeId, dbStatus } from './db.js';
+import { query, tx, lockGold, setGold, lockStats, writeStats, makeId, dbStatus } from './db.js';
+import { MARKET_GOLD_SQL } from './economySql.js';
 import {
 	isAdminUser,
 	envAdminNames,
 	newStats,
 	setPassword,
 	revokeSessions,
+	rowToUser,
 	MIN_PASSWORD
 } from './auth.js';
 import { setEntry, storeSets } from './registry.js';
 import { packTypeById } from '../packs.js';
-import {
-	getWallet,
-	getInventory,
-	getCollection,
-	getStats,
-	collectionValue,
-	packPriceGold,
-	MAX_BUY_PACKS
-} from './game.js';
+import { addPacks, getStats, getOpenings, packPriceGold, MAX_BUY_PACKS } from './game.js';
 
 /**
  * Shared secret for the CLI, from the container's environment. Unset means
@@ -68,87 +63,144 @@ const LOG_LIMIT = 300;
 // ── Lookups ────────────────────────────────────────────────────
 
 /** Find an account by username (case-insensitive) or by id. */
-export function resolveUser(ref) {
-	const db = getDb();
+export async function resolveUser(ref) {
 	const key = String(ref || '').trim();
 	if (!key) return null;
-	const byName = db.usernames[key.toLowerCase()];
-	if (byName && db.users[byName]) return db.users[byName];
-	return db.users[key] || null;
+	// One statement for both forms. The username match is tried first so that an
+	// account literally named after another account's id cannot shadow it.
+	const { rows } = await query(
+		`SELECT * FROM users WHERE username_key = $1 OR id = $2
+		  ORDER BY (username_key = $1) DESC LIMIT 1`,
+		[key.toLowerCase(), key]
+	);
+	return rowToUser(rows[0]);
 }
 
-function sessionsFor(userId) {
-	const db = getDb();
-	return Object.values(db.sessions).filter((s) => s.userId === userId);
-}
+/**
+ * The users table for the panel, as ONE query.
+ *
+ * This is the change with the largest measurable effect in the whole port. The
+ * old version called a per-user helper that made eight separate lookups, and two
+ * of those — the card count and the collection value — walked every card the
+ * player owned. Rendering the panel therefore touched every card in the database:
+ * at 71 accounts and 3,153 cards it was already the slowest page in the app, and
+ * it grew with the square of nothing useful.
+ *
+ * @param {string|null} onlyUserId restrict to one account, for the detail view
+ */
+async function userRows(onlyUserId = null) {
+	const { rows } = await query(
+		`SELECT u.id, u.username, u.admin, u.created_at,
+		        COALESCE(w.gold, 0)                              AS gold,
+		        COALESCE(c.cards, 0)                             AS cards,
+		        COALESCE(c.value, 0)                             AS collection_value,
+		        COALESCE(i.packs, 0)                             AS packs,
+		        COALESCE((s.data->>'packsOpened')::bigint, 0)    AS packs_opened,
+		        COALESCE((s.data->>'slotSpins')::bigint, 0)      AS slot_spins,
+		        COALESCE(se.n, 0)                                AS sessions,
+		        COALESCE(se.last_seen, 0)                        AS last_seen_at,
+		        (b.user_id IS NOT NULL)                          AS at_table,
+		        COALESCE(f.remaining, 0)                         AS free_spins
+		   FROM users u
+		   LEFT JOIN wallets w ON w.user_id = u.id
+		   LEFT JOIN (
+		         SELECT user_id, count(*)::int AS cards,
+		                COALESCE(SUM(${MARKET_GOLD_SQL}), 0)::bigint AS value
+		           FROM collections GROUP BY user_id
+		        ) c ON c.user_id = u.id
+		   LEFT JOIN (
+		         SELECT user_id, count(*)::int AS packs FROM inventory GROUP BY user_id
+		        ) i ON i.user_id = u.id
+		   LEFT JOIN stats s ON s.user_id = u.id
+		   LEFT JOIN (
+		         SELECT user_id, count(*)::int AS n, max(created_at) AS last_seen
+		           FROM sessions GROUP BY user_id
+		        ) se ON se.user_id = u.id
+		   LEFT JOIN blackjack b ON b.user_id = u.id
+		   LEFT JOIN free_spins f ON f.user_id = u.id
+		  WHERE $1::text IS NULL OR u.id = $1
+		  ORDER BY gold DESC`,
+		[onlyUserId]
+	);
 
-/** One row of the users table. */
-function userRow(user) {
-	const sessions = sessionsFor(user.id);
-	const stats = getStats(user.id);
-	return {
-		id: user.id,
-		username: user.username,
-		admin: isAdminUser(user),
+	const envAdmins = envAdminNames();
+	return rows.map((r) => ({
+		id: r.id,
+		username: r.username,
+		admin: isAdminUser({ username: r.username, admin: r.admin }),
 		// Named in ADMIN_USERNAMES, so the flag is not the panel's to revoke — the
 		// same condition actionAdmin() refuses on, not an approximation of it.
-		envAdmin: envAdminNames().includes(user.username.toLowerCase()),
-		createdAt: user.createdAt || 0,
-		gold: getWallet(user.id).gold || 0,
-		cards: getCollection(user.id).length,
-		packs: getInventory(user.id).length,
-		collectionValue: collectionValue(user.id),
-		packsOpened: stats.packsOpened || 0,
-		slotSpins: stats.slotSpins || 0,
-		sessions: sessions.length,
-		lastSeenAt: sessions.reduce((a, s) => Math.max(a, s.createdAt || 0), 0),
-		atTable: !!getDb().blackjack?.[user.id],
-		freeSpins: getDb().freeSpins?.[user.id]?.remaining || 0
-	};
+		envAdmin: envAdmins.includes(r.username.toLowerCase()),
+		createdAt: r.created_at || 0,
+		gold: r.gold,
+		cards: r.cards,
+		packs: r.packs,
+		collectionValue: r.collection_value,
+		packsOpened: r.packs_opened,
+		slotSpins: r.slot_spins,
+		sessions: r.sessions,
+		lastSeenAt: r.last_seen_at,
+		atTable: r.at_table,
+		freeSpins: r.free_spins
+	}));
 }
 
-export function listUsers() {
-	const db = getDb();
-	return Object.values(db.users)
-		.map(userRow)
-		.sort((a, b) => b.gold - a.gold);
+export async function listUsers() {
+	return userRows();
+}
+
+async function userRow(userId) {
+	return (await userRows(userId))[0] || null;
 }
 
 /** Server-wide figures for the top of the panel. */
-export function summary() {
-	const db = getDb();
-	const users = Object.values(db.users);
-	let gold = 0;
-	let cards = 0;
-	let packs = 0;
-	for (const u of users) {
-		gold += getWallet(u.id).gold || 0;
-		cards += getCollection(u.id).length;
-		packs += getInventory(u.id).length;
-	}
+export async function summary() {
+	// Scalar subqueries in one round trip rather than a loop over every account.
+	const { rows } = await query(
+		`SELECT (SELECT count(*)::int FROM users)                        AS users,
+		        (SELECT count(*)::int FROM users
+		          WHERE admin OR username_key = ANY($1::text[]))         AS admins,
+		        (SELECT count(*)::int FROM sessions)                     AS sessions,
+		        (SELECT COALESCE(SUM(gold), 0)::bigint FROM wallets)     AS gold,
+		        (SELECT count(*)::int FROM collections)                  AS cards,
+		        (SELECT count(*)::int FROM inventory)                    AS packs,
+		        (SELECT count(*)::int FROM serials)                      AS serials_issued,
+		        (SELECT count(*)::int FROM blackjack)                    AS tables_open`,
+		[envAdminNames()]
+	);
+	const r = rows[0];
+
 	return {
-		users: users.length,
-		admins: users.filter(isAdminUser).length,
+		users: r.users,
+		admins: r.admins,
 		envAdmins: envAdminNames(),
-		sessions: Object.keys(db.sessions).length,
-		gold,
-		cards,
-		packs,
-		serialsIssued: Object.values(db.serials || {}).reduce((a, l) => a + l.length, 0),
-		tablesOpen: Object.keys(db.blackjack || {}).length,
+		sessions: r.sessions,
+		gold: r.gold,
+		cards: r.cards,
+		packs: r.packs,
+		serialsIssued: r.serials_issued,
+		tablesOpen: r.tables_open,
 		uptimeSeconds: Math.round(process.uptime()),
 		nodeVersion: process.version,
 		tokenAuth: tokenAuthEnabled(),
-		// Where the accounts came from on this boot. `startedEmpty` on a deployment
-		// that should have data means the volume is not mounted, and is worth seeing
-		// before someone registers and starts filling a database that will vanish.
-		storage: dbStatus()
+		// Which database this is, how big it is, and whether the pool is healthy.
+		storage: await dbStatus()
 	};
 }
 
-export function auditLog(limit = 50) {
-	const db = getDb();
-	return (db.adminLog || []).slice(0, Math.max(1, Math.min(LOG_LIMIT, Number(limit) || 50)));
+export async function auditLog(limit = 50) {
+	const { rows } = await query('SELECT * FROM admin_log ORDER BY at DESC LIMIT $1', [
+		Math.max(1, Math.min(LOG_LIMIT, Number(limit) || 50))
+	]);
+	return rows.map((r) => ({
+		id: r.id,
+		at: r.at,
+		actor: r.actor,
+		via: r.via,
+		action: r.action,
+		target: r.target,
+		detail: r.detail
+	}));
 }
 
 /** Sets and their products, for the panel's pack-grant picker. */
@@ -160,20 +212,20 @@ export function grantableSets() {
 
 // ── Audit ──────────────────────────────────────────────────────
 
-function record(actor, action, target, detail) {
-	mutate((d) => {
-		const log = (d.adminLog ??= []);
-		log.unshift({
-			id: makeId(),
-			at: Date.now(),
-			actor: actor?.name || 'unknown',
-			via: actor?.via || 'panel',
-			action,
-			target: target || null,
-			detail: detail || null
-		});
-		d.adminLog = log.slice(0, LOG_LIMIT);
-	});
+async function record(actor, action, target, detail) {
+	await query(
+		`INSERT INTO admin_log (id, at, actor, via, action, target, detail)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		[makeId(), Date.now(), actor?.name || 'unknown', actor?.via || 'panel', action, target || null, detail || null]
+	);
+	// Trim to the cap. Cheap because admin_log_at_idx makes the cut-off a scan of
+	// exactly LOG_LIMIT rows.
+	await query(
+		`DELETE FROM admin_log WHERE id NOT IN (
+		   SELECT id FROM admin_log ORDER BY at DESC, id DESC LIMIT $1
+		 )`,
+		[LOG_LIMIT]
+	);
 }
 
 // ── Actions ────────────────────────────────────────────────────
@@ -181,37 +233,51 @@ function record(actor, action, target, detail) {
 // Each takes (actor, args) and returns { ok, ... } or { ok: false, error }.
 // `actor` is { name, via, id } — id is null for a token-authenticated CLI call.
 
-function withUser(args, fn) {
-	const user = resolveUser(args.user ?? args.username ?? args.id);
+async function withUser(args, fn) {
+	const user = await resolveUser(args.user ?? args.username ?? args.id);
 	if (!user) return { ok: false, error: `No account matching "${args.user ?? args.username ?? ''}".` };
 	return fn(user);
 }
 
 /** Add to (or set) a wallet. */
 function actionGold(actor, args) {
-	return withUser(args, (user) => {
+	return withUser(args, async (user) => {
 		const amount = Math.round(Number(args.amount));
 		if (!Number.isFinite(amount)) return { ok: false, error: 'Amount must be a number.' };
 
-		const before = getWallet(user.id).gold || 0;
-		const after = Math.max(0, Math.min(MAX_GOLD, args.set ? amount : before + amount));
+		const moved = await tx(async (client) => {
+			const before = (await lockGold(client, user.id)) ?? 0;
+			const after = Math.max(0, Math.min(MAX_GOLD, args.set ? amount : before + amount));
 
-		mutate((d) => {
-			(d.wallets[user.id] ??= { gold: 0 }).gold = after;
+			await client.query(
+				`INSERT INTO wallets (user_id, gold) VALUES ($1, $2)
+				 ON CONFLICT (user_id) DO UPDATE SET gold = EXCLUDED.gold`,
+				[user.id, after]
+			);
+
 			// Admin gold is not earnings. Folding it into stats.goldEarned would make
 			// the player's own net-profit figure a lie, so it is only in the audit log.
-			const s = (d.stats[user.id] ??= newStats());
+			const s = await lockStats(client, user.id);
 			s.adminGranted = (s.adminGranted || 0) + (after - before);
+			await writeStats(client, user.id, s);
+
+			return { before, after };
 		});
 
-		record(actor, 'gold', user.username, `${before} → ${after}`);
-		return { ok: true, user: user.username, before, after, delta: after - before };
+		await record(actor, 'gold', user.username, `${moved.before} → ${moved.after}`);
+		return {
+			ok: true,
+			user: user.username,
+			before: moved.before,
+			after: moved.after,
+			delta: moved.after - moved.before
+		};
 	});
 }
 
 /** Drop unopened packs straight into a vault, no charge. */
 function actionPacks(actor, args) {
-	return withUser(args, (user) => {
+	return withUser(args, async (user) => {
 		const setCode = String(args.setCode || '').toLowerCase();
 		const set = setEntry(setCode);
 		if (!set) return { ok: false, error: `Unknown set "${args.setCode}".` };
@@ -228,19 +294,18 @@ function actionPacks(actor, args) {
 
 		const qty = Math.floor(Number(args.qty ?? 1));
 		if (!(qty >= 1)) return { ok: false, error: 'Quantity must be at least 1.' };
-		// Same ceiling as a purchase: every pack is its own row and the whole vault
-		// is rewritten on each mutation.
+		// Same ceiling as a purchase, so a grant cannot be a way around it.
 		if (qty > MAX_BUY_PACKS) {
 			return { ok: false, error: `That is over the ${MAX_BUY_PACKS.toLocaleString()}-pack limit for one grant.` };
 		}
 
-		const now = Date.now();
-		mutate((d) => {
-			const inv = (d.inventory[user.id] ??= []);
-			for (let i = 0; i < qty; i++) inv.push({ id: makeId(), setCode, packTypeId, acquiredAt: now });
-		});
+		await tx((client) => addPacks(client, user.id, setCode, packTypeId, qty, Date.now()));
 
-		record(actor, 'packs', user.username, `${qty}× ${set.code.toUpperCase()} ${packTypeId}`);
+		await record(actor, 'packs', user.username, `${qty}× ${set.code.toUpperCase()} ${packTypeId}`);
+		const { rows } = await query(
+			'SELECT count(*)::int AS n FROM inventory WHERE user_id = $1',
+			[user.id]
+		);
 		return {
 			ok: true,
 			user: user.username,
@@ -248,14 +313,14 @@ function actionPacks(actor, args) {
 			setCode,
 			packTypeId,
 			worth: packPriceGold(set, packTypeId) * qty,
-			packs: getInventory(user.id).length
+			packs: rows[0].n
 		};
 	});
 }
 
 /** Grant or revoke admin. */
 function actionAdmin(actor, args) {
-	return withUser(args, (user) => {
+	return withUser(args, async (user) => {
 		const value = args.value === undefined ? true : !!args.value;
 
 		if (!value && actor.id === user.id) {
@@ -268,53 +333,54 @@ function actionAdmin(actor, args) {
 			};
 		}
 		if (!value) {
-			const db = getDb();
-			const remaining = Object.values(db.users).filter((u) => u.id !== user.id && isAdminUser(u));
-			if (!remaining.length) {
+			const { rows } = await query(
+				`SELECT count(*)::int AS n FROM users
+				  WHERE id <> $1 AND (admin OR username_key = ANY($2::text[]))`,
+				[user.id, envAdminNames()]
+			);
+			if (!rows[0].n) {
 				return { ok: false, error: 'Refusing to remove the last admin.' };
 			}
 		}
 
-		mutate((d) => {
-			if (value) d.users[user.id].admin = true;
-			else delete d.users[user.id].admin;
-		});
+		await query('UPDATE users SET admin = $2 WHERE id = $1', [user.id, value]);
 
-		record(actor, value ? 'admin.grant' : 'admin.revoke', user.username, null);
+		await record(actor, value ? 'admin.grant' : 'admin.revoke', user.username, null);
 		return { ok: true, user: user.username, admin: value };
 	});
 }
 
 /** Set a password. Signs the account out everywhere, since the credential changed. */
 function actionPassword(actor, args) {
-	return withUser(args, (user) => {
+	return withUser(args, async (user) => {
 		try {
-			setPassword(user.id, String(args.password || ''));
+			await setPassword(user.id, String(args.password || ''));
 		} catch (e) {
 			return { ok: false, error: e.message || `Password must be at least ${MIN_PASSWORD} characters.` };
 		}
-		const dropped = revokeSessions(user.id);
-		record(actor, 'password', user.username, `${dropped} session(s) revoked`);
+		const dropped = await revokeSessions(user.id);
+		await record(actor, 'password', user.username, `${dropped} session(s) revoked`);
 		return { ok: true, user: user.username, sessionsRevoked: dropped };
 	});
 }
 
 /** Sign an account out of every device. */
 function actionLogout(actor, args) {
-	return withUser(args, (user) => {
-		const dropped = revokeSessions(user.id);
-		record(actor, 'logout', user.username, `${dropped} session(s)`);
+	return withUser(args, async (user) => {
+		const dropped = await revokeSessions(user.id);
+		await record(actor, 'logout', user.username, `${dropped} session(s)`);
 		return { ok: true, user: user.username, sessionsRevoked: dropped };
 	});
 }
 
 /** Zero the statistics, keeping the account, wallet and cards. */
 function actionResetStats(actor, args) {
-	return withUser(args, (user) => {
-		mutate((d) => {
-			d.stats[user.id] = newStats();
+	return withUser(args, async (user) => {
+		await tx(async (client) => {
+			await lockStats(client, user.id);
+			await writeStats(client, user.id, newStats());
 		});
-		record(actor, 'stats.reset', user.username, null);
+		await record(actor, 'stats.reset', user.username, null);
 		return { ok: true, user: user.username };
 	});
 }
@@ -325,23 +391,26 @@ function actionResetStats(actor, args) {
  * this is the reset for that, and it refunds nothing.
  */
 function actionUnstick(actor, args) {
-	return withUser(args, (user) => {
-		const had = {
-			table: !!getDb().blackjack?.[user.id],
-			freeSpins: getDb().freeSpins?.[user.id]?.remaining || 0
-		};
-		mutate((d) => {
-			delete d.blackjack?.[user.id];
-			delete d.freeSpins?.[user.id];
+	return withUser(args, async (user) => {
+		const had = await tx(async (client) => {
+			const { rowCount: table } = await client.query(
+				'DELETE FROM blackjack WHERE user_id = $1',
+				[user.id]
+			);
+			const { rows: fs } = await client.query(
+				'DELETE FROM free_spins WHERE user_id = $1 RETURNING remaining',
+				[user.id]
+			);
+			return { table: table > 0, freeSpins: fs[0]?.remaining || 0 };
 		});
-		record(actor, 'unstick', user.username, `table=${had.table} freeSpins=${had.freeSpins}`);
+		await record(actor, 'unstick', user.username, `table=${had.table} freeSpins=${had.freeSpins}`);
 		return { ok: true, user: user.username, cleared: had };
 	});
 }
 
 /** Delete an account and everything attached to it. */
 function actionDelete(actor, args) {
-	return withUser(args, (user) => {
+	return withUser(args, async (user) => {
 		if (!args.confirm) {
 			return { ok: false, error: `Deleting ${user.username} is permanent — pass confirm to go ahead.` };
 		}
@@ -349,46 +418,53 @@ function actionDelete(actor, args) {
 			return { ok: false, error: 'Refusing to delete the account you are signed in as.' };
 		}
 
-		const row = userRow(user);
-		mutate((d) => {
-			delete d.users[user.id];
-			delete d.usernames[user.username.toLowerCase()];
-			for (const [token, s] of Object.entries(d.sessions)) {
-				if (s.userId === user.id) delete d.sessions[token];
-			}
-			for (const bucket of ['wallets', 'inventory', 'collections', 'stats', 'openings', 'freeSpins', 'blackjack']) {
-				delete d[bucket]?.[user.id];
-			}
-			// d.serials is deliberately untouched: a serialized card is a physical
-			// object with a finite print run, and releasing #137/250 back into the
-			// pool because its owner left would let a second one exist.
-		});
+		// Read the figures for the audit entry before the rows go away.
+		const row = await userRow(user.id);
 
-		record(actor, 'delete', user.username, `${row.cards} cards, ${row.packs} packs, ${row.gold} gold`);
+		// One DELETE. Sessions, wallet, inventory, collection, stats, openings, the
+		// blackjack table and any free spins all have ON DELETE CASCADE, so this is
+		// the whole teardown and it cannot leave half an account behind.
+		//
+		// `serials` is deliberately NOT among them: it has no foreign key to users at
+		// all. A serialized card is a physical object with a finite print run, and
+		// releasing #137/250 back into the pool because its owner left would let a
+		// second one exist.
+		await query('DELETE FROM users WHERE id = $1', [user.id]);
+
+		await record(
+			actor,
+			'delete',
+			user.username,
+			`${row?.cards ?? 0} cards, ${row?.packs ?? 0} packs, ${row?.gold ?? 0} gold`
+		);
 		return { ok: true, user: user.username, removed: row };
 	});
 }
 
 // ── Reads, as actions (so the CLI can ask for them too) ────────
 
-function actionOverview() {
-	return { ok: true, summary: summary(), users: listUsers(), log: auditLog(30) };
+async function actionOverview() {
+	const [s, users, log] = await Promise.all([summary(), listUsers(), auditLog(30)]);
+	return { ok: true, summary: s, users, log };
 }
 
-function actionUsers() {
-	return { ok: true, users: listUsers() };
+async function actionUsers() {
+	return { ok: true, users: await listUsers() };
 }
 
 function actionUser(actor, args) {
-	return withUser(args, (user) => {
-		const stats = getStats(user.id);
-		const openings = (getDb().openings?.[user.id] || []).slice(0, 5);
-		return { ok: true, user: { ...userRow(user), stats, openings } };
+	return withUser(args, async (user) => {
+		const [row, stats, openings] = await Promise.all([
+			userRow(user.id),
+			getStats(user.id),
+			getOpenings(user.id)
+		]);
+		return { ok: true, user: { ...row, stats, openings: openings.slice(0, 5) } };
 	});
 }
 
-function actionLog(actor, args) {
-	return { ok: true, log: auditLog(args.limit ?? 50) };
+async function actionLog(actor, args) {
+	return { ok: true, log: await auditLog(args.limit ?? 50) };
 }
 
 /**
@@ -418,13 +494,13 @@ export const ACTION_NAMES = Object.keys(HANDLERS);
  * @param {string} action
  * @param {object} args
  */
-export function runAdminAction(actor, action, args = {}) {
+export async function runAdminAction(actor, action, args = {}) {
 	const handler = HANDLERS[String(action || '')];
 	if (!handler) {
 		return { ok: false, error: `Unknown action "${action}". Try one of: ${ACTION_NAMES.join(', ')}.` };
 	}
 	try {
-		return handler(actor, args);
+		return await handler(actor, args);
 	} catch (e) {
 		console.error(`admin action ${action} failed:`, e);
 		return { ok: false, error: e?.message || 'The action failed.' };

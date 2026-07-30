@@ -11,8 +11,10 @@
  * stuck, so it cannot be claimed on demand.
  */
 
-import { mutate, makeId } from './db.js';
-import { getCollection, getInventory, getWallet, packPriceGold } from './game.js';
+import { query, tx, lockGold, setGold, lockStats, writeStats, makeId } from './db.js';
+import { COLLECTION_SELL_VALUE_SQL } from './economySql.js';
+import { COLLECTION_COLUMNS, cardToValues, valuesClause } from './rows.js';
+import { packPriceGold } from './game.js';
 import { setEntry, storeSets } from './registry.js';
 import { getSetPool, cachedPoolCodes } from './scryfall.js';
 import { cardSellGold } from '../economy.js';
@@ -33,25 +35,48 @@ const MAX_CARDS = 15;
 /**
  * Everything the player could turn into gold right now: gold in hand, what the
  * shop would pay for their cards, and the buy-back value of unopened packs.
+ *
+ * This runs on EVERY page load, because the layout uses it to decide whether to
+ * show the Bulk Bin banner. It used to load the entire collection and the entire
+ * vault to add up two numbers; now the card total is summed in the database and
+ * the vault is grouped by product, so the rows that come back are one per set and
+ * pack type rather than one per card.
+ *
+ * The pack total still has to be finished in JS: packPriceGold() reads the live
+ * TCGplayer cache and the vintage EV floors, which are in-process and not in
+ * Postgres. Grouping is what makes that cheap — it is called once per distinct
+ * product, not once per pack.
  */
-export function netWorthGold(userId) {
-	const gold = getWallet(userId).gold || 0;
+export async function netWorthGold(userId) {
+	const [walletAndCards, byProduct] = await Promise.all([
+		query(
+			`SELECT COALESCE((SELECT gold FROM wallets WHERE user_id = $1), 0) AS gold,
+			        COALESCE((${COLLECTION_SELL_VALUE_SQL}), 0) AS cards`,
+			[userId]
+		),
+		query(
+			`SELECT set_code, pack_type_id, count(*)::int AS count
+			   FROM inventory WHERE user_id = $1
+			  GROUP BY set_code, pack_type_id`,
+			[userId]
+		)
+	]);
 
-	let cards = 0;
-	for (const c of getCollection(userId)) cards += cardSellGold(c.valueUsd);
+	const gold = walletAndCards.rows[0].gold;
+	const cards = walletAndCards.rows[0].cards;
 
 	let packs = 0;
-	for (const item of getInventory(userId)) {
-		const set = setEntry(item.setCode);
-		if (set) packs += packPriceGold(set, item.packTypeId);
+	for (const r of byProduct.rows) {
+		const set = setEntry(r.set_code);
+		if (set) packs += packPriceGold(set, r.pack_type_id) * r.count;
 	}
 
 	return { gold, cards, packs, total: gold + cards + packs };
 }
 
 /** True when the player has no move left. */
-export function isStuck(userId) {
-	return netWorthGold(userId).total < STUCK_BELOW;
+export async function isStuck(userId) {
+	return (await netWorthGold(userId)).total < STUCK_BELOW;
 }
 
 /**
@@ -129,7 +154,7 @@ function instanceFor(card, setName) {
  * Refuses unless the player is actually stuck.
  */
 export async function rescue(userId) {
-	const before = netWorthGold(userId);
+	const before = await netWorthGold(userId);
 	if (before.total >= STUCK_BELOW) {
 		return { ok: false, error: 'You still have something to work with.' };
 	}
@@ -164,16 +189,31 @@ export async function rescue(userId) {
 	const shortfall = Math.max(0, RESCUE_TARGET - value);
 
 	const now = Date.now();
-	mutate((d) => {
-		const coll = (d.collections[userId] ??= []);
-		for (const c of granted) coll.push({ ...c, acquiredAt: now, sold: false });
-		if (shortfall > 0) {
-			d.wallets[userId].gold = (d.wallets[userId].gold || 0) + shortfall;
-			const st = (d.stats[userId] ??= {});
-			st.goldEarned = (st.goldEarned || 0) + shortfall;
+	const walletGold = await tx(async (client) => {
+		const gold = await lockGold(client, userId);
+		if (gold == null) throw new Error('No wallet.');
+
+		if (granted.length) {
+			for (const c of granted) {
+				c.acquiredAt = now;
+				c.sold = false;
+			}
+			await client.query(
+				`INSERT INTO collections (${COLLECTION_COLUMNS.join(', ')})
+				 VALUES ${valuesClause(granted.length, COLLECTION_COLUMNS.length)}`,
+				granted.flatMap((c) => cardToValues(userId, c))
+			);
 		}
-		const st = (d.stats[userId] ??= {});
-		st.rescues = (st.rescues || 0) + 1;
+
+		const s = await lockStats(client, userId);
+		if (shortfall > 0) {
+			await setGold(client, userId, gold + shortfall);
+			s.goldEarned = (s.goldEarned || 0) + shortfall;
+		}
+		s.rescues = (s.rescues || 0) + 1;
+		await writeStats(client, userId, s);
+
+		return gold + shortfall;
 	});
 
 	return {
@@ -181,7 +221,7 @@ export async function rescue(userId) {
 		cards: granted,
 		gold: shortfall,
 		setName: found?.set?.name || null,
-		worth: netWorthGold(userId),
-		walletGold: getWallet(userId).gold
+		worth: await netWorthGold(userId),
+		walletGold
 	};
 }

@@ -8,9 +8,14 @@
 #
 #   ./deploy/pi/install.sh
 #
-# Safe to re-run: it installs what is missing, keeps the answers already in
-# .env, and brings the stack up either way. Nothing here is Pi-specific except
-# the storage advice — it works on any arm64 Debian or Ubuntu.
+# Safe to re-run, and re-running IS the update: it installs what is missing,
+# keeps every answer already in .env, pulls the published image and recreates the
+# containers on it. Nothing it does touches the database, the cache or the
+# credentials — those live in bind mounts and .env, both of which it leaves
+# alone. `./install.sh --update` is the same thing with the questions skipped.
+#
+# Nothing here is Pi-specific except the storage advice — it works on any arm64
+# Debian or Ubuntu.
 #
 # What it does NOT do is create the Cloudflare tunnel for you. That needs a
 # dashboard login, and the token it produces is the one thing this script cannot
@@ -28,16 +33,21 @@ ADMIN_USERNAMES=${ADMIN_USERNAMES:-}
 ADMIN_TOKEN=${ADMIN_TOKEN:-}
 DATA_DIR=${DATA_DIR:-}
 CACHE_DIR=${CACHE_DIR:-}
+DB_DIR=${DB_DIR:-}
+POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-}
 NEXTCLOUD_URL=${NEXTCLOUD_URL:-}
 NEXTCLOUD_USER=${NEXTCLOUD_USER:-}
 NEXTCLOUD_PASS=${NEXTCLOUD_PASS:-}
 NEXTCLOUD_PATH=${NEXTCLOUD_PATH:-}
 TAG=${TAG:-latest}
+AUTO_UPDATE=${AUTO_UPDATE:-}
+UPDATE_INTERVAL=${UPDATE_INTERVAL:-}
 TARGET_DIR=${TARGET_DIR:-$HOME/Pack-Ripper}
 ASSUME_YES=0
 DRY_RUN=0
 DIR_EXPLICIT=0
 NO_BACKUP=0
+UPDATE_ONLY=0
 
 # ── output ─────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -50,6 +60,7 @@ say()  { printf '    %s\n' "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$G" "$N" "$*"; }
 warn() { printf '%s warn%s %s\n' "$Y" "$N" "$*" >&2; }
 die()  { printf '\n%sfail%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+shortid() { printf '%s' "${1#sha256:}" | cut -c1-12; }
 
 # Every privileged or network-touching action goes through this, so --dry-run is
 # a real audit of what the script would do rather than a second code path that
@@ -81,10 +92,18 @@ PackRipper installer for a Raspberry Pi (64-bit).
   --token TOKEN          Cloudflare tunnel token (or set TUNNEL_TOKEN)
   --admin-user NAMES     comma-separated accounts that get the admin panel
   --admin-token TOKEN    shared secret for the admin CLI (generated if unset)
-  --data-dir PATH        where the database lives   (default: <dir>/deploy/pi/.data)
+  --db-dir PATH          where Postgres stores the database (default: <dir>/deploy/pi/.pgdata)
+  --data-dir PATH        legacy db.json to import, if any   (default: <dir>/deploy/pi/.data)
   --cache-dir PATH       where the API cache lives  (default: <dir>/deploy/pi/.cache)
   --dir PATH             where to clone the repo    (default: ~/Pack-Ripper)
   --tag TAG              image tag to run           (default: latest)
+
+Updating an install that is already here (data, .env and answers are kept):
+  --update               pull the published image and recreate, asking nothing
+  --auto-update          keep up to date by itself     (default: on)
+  --no-auto-update       stop that, and remove the timer if one is installed
+  --update-interval SPEC how often to look: 15m, 2h, hourly, daily, or any
+                         systemd OnCalendar expression   (default: 15m)
 
 Hourly off-box backup of the database to a Nextcloud (optional, all four or none):
   --nextcloud-url URL    server root, e.g. https://cloud.example.com
@@ -106,10 +125,15 @@ while [ $# -gt 0 ]; do
 		--token) TUNNEL_TOKEN=${2:?--token needs a value}; shift 2 ;;
 		--admin-user | --admin-users) ADMIN_USERNAMES=${2:?--admin-user needs a value}; shift 2 ;;
 		--admin-token) ADMIN_TOKEN=${2:?--admin-token needs a value}; shift 2 ;;
+		--db-dir) DB_DIR=${2:?--db-dir needs a value}; shift 2 ;;
 		--data-dir) DATA_DIR=${2:?--data-dir needs a value}; shift 2 ;;
 		--cache-dir) CACHE_DIR=${2:?--cache-dir needs a value}; shift 2 ;;
 		--dir) TARGET_DIR=${2:?--dir needs a value}; DIR_EXPLICIT=1; shift 2 ;;
 		--tag) TAG=${2:?--tag needs a value}; shift 2 ;;
+		--update) UPDATE_ONLY=1; ASSUME_YES=1; NO_BACKUP=1; shift ;;
+		--auto-update) AUTO_UPDATE=on; shift ;;
+		--no-auto-update) AUTO_UPDATE=off; shift ;;
+		--update-interval) UPDATE_INTERVAL=${2:?--update-interval needs a value}; shift 2 ;;
 		--nextcloud-url) NEXTCLOUD_URL=${2:?--nextcloud-url needs a value}; shift 2 ;;
 		--nextcloud-user) NEXTCLOUD_USER=${2:?--nextcloud-user needs a value}; shift 2 ;;
 		--nextcloud-pass) NEXTCLOUD_PASS=${2:?--nextcloud-pass needs a value}; shift 2 ;;
@@ -311,21 +335,39 @@ env_get() {
 [ -n "$ADMIN_TOKEN" ] || ADMIN_TOKEN=$(env_get ADMIN_TOKEN)
 [ -n "$DATA_DIR" ] || DATA_DIR=$(env_get DATA_DIR)
 [ -n "$CACHE_DIR" ] || CACHE_DIR=$(env_get CACHE_DIR)
+[ -n "$DB_DIR" ] || DB_DIR=$(env_get DB_DIR)
+[ -n "$POSTGRES_PASSWORD" ] || POSTGRES_PASSWORD=$(env_get POSTGRES_PASSWORD)
 [ -n "$NEXTCLOUD_URL" ] || NEXTCLOUD_URL=$(env_get NEXTCLOUD_URL)
 [ -n "$NEXTCLOUD_USER" ] || NEXTCLOUD_USER=$(env_get NEXTCLOUD_USER)
 [ -n "$NEXTCLOUD_PASS" ] || NEXTCLOUD_PASS=$(env_get NEXTCLOUD_PASS)
 [ -n "$NEXTCLOUD_PATH" ] || NEXTCLOUD_PATH=$(env_get NEXTCLOUD_PATH)
+[ -n "$AUTO_UPDATE" ] || AUTO_UPDATE=$(env_get AUTO_UPDATE)
+[ -n "$UPDATE_INTERVAL" ] || UPDATE_INTERVAL=$(env_get UPDATE_INTERVAL)
+# On unless someone turned it off. A Pi nobody logs into is the whole point of
+# this deployment, and an app that never gets the fix is the failure mode.
+[ -n "$AUTO_UPDATE" ] || AUTO_UPDATE=on
+[ -n "$UPDATE_INTERVAL" ] || UPDATE_INTERVAL=15m
+
+# --update is for a machine that is already set up: it keeps everything and only
+# moves the image forward. Refusing to run it against nothing is better than
+# silently doing a first install with every answer defaulted.
+if [ "$UPDATE_ONLY" = 1 ] && [ ! -f "$ENV_FILE" ]; then
+	die "--update, but there is no $ENV_FILE to update. Run the installer without
+      it (or with --domain/--token) to set this machine up first."
+fi
 
 root_dev=$(findmnt -no SOURCE / 2>/dev/null || echo '')
 on_sd=0
 case $root_dev in *mmcblk*) on_sd=1 ;; esac
 
-if [ -z "$DATA_DIR" ] && [ "$on_sd" = 1 ]; then
+if [ -z "$DB_DIR" ] && [ "$on_sd" = 1 ]; then
 	warn "this Pi boots from an SD card ($root_dev)."
-	say 'db.js rewrites the WHOLE database on every mutation — every slot spin, every'
-	say 'blackjack hit — and that file is already ~4 MB. An evening of slots is'
-	say 'gigabytes of writes to one spot on a card with no wear-levelling worth the'
-	say 'name. A USB SSD is the single change that decides whether the storage lasts.'
+	say 'The database is Postgres, which writes the row that changed plus a WAL record —'
+	say 'kilobytes per slot spin, where the old JSON file rewrote all ~4 MB of every'
+	say 'account on every one. So this matters much less than it used to, and it still'
+	say 'matters: a busy evening is steady small writes to one spot on a card with no'
+	say 'wear-levelling worth the name. A USB SSD is the change that decides whether'
+	say 'the storage lasts years instead of months.'
 
 	# Suggest, never mount or format anything: picking the wrong disk and
 	# formatting it is not a mistake a convenience script gets to make.
@@ -336,25 +378,31 @@ if [ -z "$DATA_DIR" ] && [ "$on_sd" = 1 ]; then
 		say 'Mounted non-SD filesystems that look usable:'
 		printf '      %s\n' $candidates
 		ask picked 'Path for the database (blank = keep it on the SD card)' ''
-		[ -z "$picked" ] || DATA_DIR=$picked/packripper/.data
+		[ -z "$picked" ] || DB_DIR=$picked/packripper/.pgdata
 		[ -z "$picked" ] || [ -n "$CACHE_DIR" ] || CACHE_DIR=$picked/packripper/.cache
 	else
 		say ''
 		say 'No other disk is mounted. Attach one, mount it, and re-run with'
-		say '  --data-dir /mnt/ssd/packripper/.data --cache-dir /mnt/ssd/packripper/.cache'
+		say '  --db-dir /mnt/ssd/packripper/.pgdata --cache-dir /mnt/ssd/packripper/.cache'
 		confirm 'Continue on the SD card for now?' || die 'stopped at your request'
 	fi
 fi
 
-if [ -n "$DATA_DIR" ]; then
-	run mkdir -p "$DATA_DIR"
-	ok "database: $DATA_DIR"
+if [ -n "$DB_DIR" ]; then
+	run mkdir -p "$DB_DIR"
+	ok "database: $DB_DIR (Postgres)"
 else
-	ok "database: $DEPLOY_DIR/.data (on $root_dev)"
+	ok "database: $DEPLOY_DIR/.pgdata (Postgres, on $root_dev)"
 fi
 if [ -n "$CACHE_DIR" ]; then
 	run mkdir -p "$CACHE_DIR"
 	ok "cache: $CACHE_DIR"
+fi
+# Only worth creating if there is an old database to carry across. An empty one
+# is harmless — the app just finds nothing to import.
+if [ -n "$DATA_DIR" ]; then
+	run mkdir -p "$DATA_DIR"
+	ok "legacy import dir: $DATA_DIR"
 fi
 
 # ── 6. the tunnel, and the rest of .env ────────────────────────
@@ -430,6 +478,19 @@ if [ -z "$ADMIN_TOKEN" ]; then
 	say 'generated an ADMIN_TOKEN'
 fi
 
+# Generated once and then reused from .env forever, because it is baked into the
+# Postgres data directory at initdb time: changing it later does NOT change the
+# password the server actually wants, and the app then cannot log in. Hex rather
+# than base64 so there is no character a connection URL would need escaped.
+if [ -z "$POSTGRES_PASSWORD" ]; then
+	if command -v openssl >/dev/null 2>&1; then
+		POSTGRES_PASSWORD=$(openssl rand -hex 24)
+	else
+		POSTGRES_PASSWORD=$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')
+	fi
+	say 'generated a POSTGRES_PASSWORD'
+fi
+
 # 0600 before a byte is written, not chmod'd after: this file holds a Cloudflare
 # credential for your whole account and the admin secret for the app.
 if [ "$DRY_RUN" = 1 ]; then
@@ -439,7 +500,7 @@ else
 		umask 077
 		cat > "$ENV_FILE" <<EOF
 # Written by deploy/pi/install.sh. Safe to edit; re-running the installer keeps
-# whatever is in here. Mode 0600 — it holds two credentials.
+# whatever is in here. Mode 0600 — it holds three credentials.
 
 DOMAIN=$DOMAIN
 TUNNEL_TOKEN=$TUNNEL_TOKEN
@@ -447,9 +508,22 @@ TUNNEL_TOKEN=$TUNNEL_TOKEN
 TAG=$TAG
 BODY_SIZE_LIMIT=2M
 
+# Read by install.sh and update.sh, not by compose. AUTO_UPDATE=off leaves the
+# timer uninstalled; the interval is a systemd OnCalendar, or 15m/2h/hourly/daily.
+AUTO_UPDATE=$AUTO_UPDATE
+UPDATE_INTERVAL=$UPDATE_INTERVAL
+
 ADMIN_USERNAMES=$ADMIN_USERNAMES
 ADMIN_TOKEN=$ADMIN_TOKEN
+
+# Postgres. POSTGRES_PASSWORD is fixed at the moment the data directory is first
+# created — editing it here afterwards locks the app out rather than rotating it.
+# To actually change it: ALTER USER inside the container, then update this.
+POSTGRES_USER=packripper
+POSTGRES_DB=packripper
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 EOF
+		[ -z "$DB_DIR" ] || echo "DB_DIR=$DB_DIR" >> "$ENV_FILE"
 		[ -z "$DATA_DIR" ] || echo "DATA_DIR=$DATA_DIR" >> "$ENV_FILE"
 		[ -z "$CACHE_DIR" ] || echo "CACHE_DIR=$CACHE_DIR" >> "$ENV_FILE"
 		if [ -n "$NEXTCLOUD_URL" ]; then
@@ -467,16 +541,34 @@ EOF
 fi
 
 # ── 7. up ──────────────────────────────────────────────────────
-step 'Starting'
-
 compose() {
 	run "${DOCKER[@]}" compose --project-directory "$DEPLOY_DIR" \
 		-f "$DEPLOY_DIR/compose.yml" "$@"
 }
 
+# What is running right now, if anything. Two things use it: the wording below,
+# and the cleanup after the health check, which removes the image this one
+# supersedes. Not in a dry run — `sudo docker` there would ask for a password
+# this script has deliberately not asked for.
+PREV_APP_IMAGE=
+if [ "$DRY_RUN" = 0 ]; then
+	PREV_APP_IMAGE=$("${DOCKER[@]}" inspect --format '{{.Image}}' packripper 2>/dev/null || true)
+fi
+
+if [ -n "$PREV_APP_IMAGE" ]; then
+	step 'Updating the running stack'
+	say 'the containers are replaced; the database, the cache and .env are not —'
+	say 'they are bind mounts and a file, and nothing here writes to them.'
+else
+	step 'Starting'
+fi
+
 # Not fatal. A re-run on flaky wifi should still bring up the image already on
 # the disk rather than abort because the registry was briefly unreachable.
 compose pull || warn 'could not pull; using whatever image is already here'
+# No -v, ever, and no `down` first: `up -d` recreates only the containers whose
+# image or configuration actually changed, and leaves the volumes alone in every
+# case. That is what makes re-running this an update rather than a reinstall.
 compose up -d
 
 # ── 8. wait for it ─────────────────────────────────────────────
@@ -519,6 +611,20 @@ else
       ${DOCKER[*]} logs packripper 2>&1 | grep -i tunnel"
 fi
 
+# Say what the update actually did, and only then drop the image it replaced —
+# which is now untagged and a couple of hundred megabytes on a disk that may
+# still be an SD card. GHCR keeps every build, so going back is TAG=sha-<short>
+# in .env and another run of this script.
+NEW_APP_IMAGE=$("${DOCKER[@]}" inspect --format '{{.Image}}' packripper 2>/dev/null || true)
+if [ -n "$PREV_APP_IMAGE" ] && [ "$PREV_APP_IMAGE" = "$NEW_APP_IMAGE" ]; then
+	ok 'already on the published image — nothing to update'
+elif [ -n "$PREV_APP_IMAGE" ] && [ -n "$NEW_APP_IMAGE" ]; then
+	ok "updated: $(shortid "$PREV_APP_IMAGE") -> $(shortid "$NEW_APP_IMAGE")"
+	if [ "$app_ok" = 1 ] && "${DOCKER[@]}" image rm "$PREV_APP_IMAGE" >/dev/null 2>&1; then
+		say "removed the image it replaced ($(shortid "$PREV_APP_IMAGE"))"
+	fi
+fi
+
 fi  # end of the wait, skipped by --dry-run
 
 # ── 9. hourly backups ──────────────────────────────────────────
@@ -535,9 +641,11 @@ elif [ -n "$NEXTCLOUD_URL" ]; then
 	# Pi: Persistent=true runs a run that was missed while the Pi was off, and
 	# the output lands in the journal instead of in mail nobody reads.
 	#
-	# No User=, so it runs as root. That is not laziness — the container runs as
-	# root, so everything it writes into the bind-mounted .data is root-owned and
-	# an unprivileged unit could not read the database it is meant to be saving.
+	# No User=, so it runs as root. The reason changed with the database but did
+	# not go away: backup.sh no longer reads root-owned files out of a bind mount,
+	# it runs pg_dump via `docker exec` — and talking to the Docker socket is the
+	# same privilege by a different name. Running it as a normal user would mean
+	# adding that user to the `docker` group, which grants root on the host anyway.
 	install_file /etc/systemd/system/packripper-backup.service <<EOF
 [Unit]
 Description=PackRipper database backup to Nextcloud
@@ -599,12 +707,115 @@ EOF
 	fi
 fi
 
+# ── 10. staying up to date ─────────────────────────────────────
+#
+# A timer that polls, because there is no webhook to be had: GHCR does not send
+# one, and a Pi behind a tunnel publishes no port for it to arrive on. A manifest
+# request every quarter of an hour costs nothing and means a push to main is live
+# here within about twenty minutes without anyone logging in.
+#
+# The work itself is update.sh, not `compose pull && up -d` inlined here, because
+# an unattended update needs the part a person does by hand: wait for the new
+# image to answer, and put the old one back if it does not.
+
+# systemd wants an OnCalendar; people want to type "15m".
+oncalendar() {
+	case $1 in
+		hourly | daily | weekly) printf '%s' "$1" ;;
+		*[0-9]m) printf '*:0/%s' "${1%m}" ;;
+		*[0-9]h) printf '0/%s:00' "${1%h}" ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+UPDATE_STATE=off
+if [ "$AUTO_UPDATE" = off ]; then
+	# "off" has to mean off on a machine that was set up with it on, or it only
+	# means "off next time".
+	if [ "$HAVE_SYSTEMD" = 1 ] && [ -f /etc/systemd/system/packripper-update.timer ]; then
+		step 'Turning automatic updates off'
+		run "${SUDO[@]}" systemctl disable --now packripper-update.timer 2>/dev/null || true
+		run "${SUDO[@]}" rm -f /etc/systemd/system/packripper-update.timer \
+			/etc/systemd/system/packripper-update.service
+		run "${SUDO[@]}" systemctl daemon-reload || true
+		[ "$DRY_RUN" = 1 ] || ok 'the timer is gone; updates are manual again'
+	fi
+elif [ "$HAVE_SYSTEMD" = 0 ]; then
+	step 'Installing the auto-updater'
+	warn "no systemd, so there is no timer to install. Add this to \`crontab -e\` instead:
+        */15 * * * * $DEPLOY_DIR/update.sh >/dev/null"
+	UPDATE_STATE=notimer
+else
+	step 'Installing the auto-updater'
+
+	ONCALENDAR=$(oncalendar "$UPDATE_INTERVAL")
+	if command -v systemd-analyze >/dev/null 2>&1; then
+		systemd-analyze calendar "$ONCALENDAR" >/dev/null 2>&1 ||
+			die "--update-interval $UPDATE_INTERVAL means OnCalendar=$ONCALENDAR, which systemd
+      does not understand. Try 15m, 2h, hourly, daily, or a calendar expression
+      that \`systemd-analyze calendar\` accepts."
+	fi
+
+	[ -x "$DEPLOY_DIR/update.sh" ] || run chmod +x "$DEPLOY_DIR/update.sh"
+
+	# Root, for the same reason the backup unit is: it drives the Docker socket,
+	# and access to that socket is root on the host under another name.
+	install_file /etc/systemd/system/packripper-update.service <<EOF
+[Unit]
+Description=PackRipper update to the published image
+Documentation=https://github.com/tahuffman1s/Pack-Ripper
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$DEPLOY_DIR/update.sh
+# The pull, then up to four minutes waiting for the new image to answer, then
+# possibly the same again rolling back. Generous, because being killed halfway
+# through a rollback is the one outcome worse than a failed update.
+TimeoutStartSec=1200
+Nice=10
+IOSchedulingClass=idle
+EOF
+
+	install_file /etc/systemd/system/packripper-update.timer <<EOF
+[Unit]
+Description=Look for a new PackRipper image
+
+[Timer]
+OnCalendar=$ONCALENDAR
+# A Pi that was off through a release should update when it comes back, not wait
+# for the next slot.
+Persistent=true
+# Not every Pi asking GHCR on the same tick, and it keeps the update off the
+# stroke of the hour where the backup timer already is.
+RandomizedDelaySec=3m
+
+[Install]
+WantedBy=timers.target
+EOF
+
+	run "${SUDO[@]}" systemctl daemon-reload || warn 'systemctl daemon-reload failed'
+	run "${SUDO[@]}" systemctl enable --now packripper-update.timer 2>/dev/null ||
+		warn 'could not enable the update timer'
+	[ "$DRY_RUN" = 1 ] || ok "timer installed: packripper-update.timer, OnCalendar=$ONCALENDAR"
+	UPDATE_STATE=on
+
+	# A pinned tag never moves, so the timer would run forever and change nothing.
+	# Worth saying out loud rather than leaving someone to wonder.
+	case $TAG in
+		latest) : ;;
+		*) warn "TAG=$TAG is pinned, so automatic updates will find nothing to do.
+      Set TAG=latest in $ENV_FILE to follow main." ;;
+	esac
+fi
+
 if [ "$DRY_RUN" = 1 ]; then
 	step 'Dry run finished — nothing was changed'
 	exit 0
 fi
 
-# ── 10. what is left ───────────────────────────────────────────
+# ── 11. what is left ───────────────────────────────────────────
 step 'Done'
 cat <<EOF
 
@@ -622,17 +833,57 @@ $([ -n "$ADMIN_USERNAMES" ] && printf '      %s gets the /admin panel from its n
 
     ${B}Day to day${N}
       cd $DEPLOY_DIR
-      ${DOCKER[*]} compose logs -f app          # 'db: loaded N account(s)' is the line to read
-      ${DOCKER[*]} compose pull && ${DOCKER[*]} compose up -d   # ship a new build
-      \$EDITOR .env                             # pin TAG=sha-<short> to know what is running
+      ${DOCKER[*]} compose logs -f app   # 'db: loaded N account(s)' is the line to read
+      ./update.sh                        # move to the published build now
+      \$EDITOR .env                      # pin TAG=sha-<short> to know what is running
 
 EOF
+
+case $UPDATE_STATE in
+	on)
+		cat <<EOF
+    ${B}Updates${N} — automatic, checked on OnCalendar=$ONCALENDAR
+      A push to main builds an image; this Pi picks it up within the hour with no
+      login. Only the app container is replaced — the database, the cache and
+      .env are untouched, and \`db\` is never pulled, because a Postgres major
+      bump needs a dump in hand rather than a timer.
+
+      If a new build does not answer /api/health within four minutes, the old
+      image is put back and the bad one is recorded in .update-skip so the next
+      run does not walk into it again. Nothing is left down.
+
+      ${SUDO[*]} systemctl list-timers packripper-update   # when it next looks
+      ${SUDO[*]} journalctl -u packripper-update -n 30     # what it did
+      ./update.sh --check                    # is there anything to move to?
+      ./install.sh --no-auto-update          # stop doing this
+
+EOF
+		;;
+	notimer)
+		cat <<EOF
+    ${B}Updates are manual on this machine.${N} There is no systemd here to hold a
+    timer, so add the cron line printed above, or run it yourself when you want
+    a new build:
+      $DEPLOY_DIR/update.sh
+
+EOF
+		;;
+	*)
+		cat <<EOF
+    ${B}Updates are manual.${N} Nothing polls for a new build; when you want one:
+      $DEPLOY_DIR/update.sh
+    Turn the timer on with:
+      $DEPLOY_DIR/install.sh --update --auto-update
+
+EOF
+		;;
+esac
 
 case $BACKUP_STATE in
 	on)
 		cat <<EOF
     ${B}Backups${N} — hourly to $NEXTCLOUD_URL, in $NEXTCLOUD_PATH/
-      24 hourly slots (db-hHH.tar.gz) and 7 daily ones (db-dN.tar.gz), each
+      24 hourly slots (db-hHH.sql.gz) and 7 daily ones (db-dN.sql.gz), each
       overwritten as it comes round, so the last day is covered hour by hour and
       the last week day by day. Nothing to prune.
 
@@ -640,10 +891,12 @@ case $BACKUP_STATE in
       ${SUDO[*]} journalctl -u packripper-backup -n 20     # what it did
       $DEPLOY_DIR/backup.sh --test        # re-check the credentials
 
-      To restore: download a slot, then
-        ${DOCKER[*]} compose down
-        tar xzf db-hHH.tar.gz -C ${DATA_DIR:-$DEPLOY_DIR/.data}
-        ${DOCKER[*]} compose up -d
+      Each slot is a pg_dump, so it restores into any Postgres — including a
+      newer major on a machine you have just rebuilt. Download a slot, then:
+        gzip -dc db-hHH.sql.gz | ${DOCKER[*]} exec -i packripper-db \\
+          psql -U packripper -d packripper
+      The dump is --clean --if-exists, so it drops and recreates as it goes and
+      needs no empty database to land in.
 
 EOF
 		;;

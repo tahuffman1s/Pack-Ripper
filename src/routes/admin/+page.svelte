@@ -235,52 +235,63 @@
 </div>
 
 <!-- ── storage ─────────────────────────────────────────────────
-     The whole database is one file. Whether it was found on this boot is the
-     difference between a mounted volume and one that quietly is not, so it is
-     stated rather than left to be discovered after a wipe. -->
+     Which database this is, how big it is, and whether the pool is healthy. Much
+     less dramatic than it used to be: this card existed to catch a JSON file that
+     had not been found on a share that had not mounted, which is a failure mode
+     Postgres does not have. What is left worth showing is that the connection is
+     up, and whether a legacy import ran on this boot. -->
 {#if data.summary.storage}
 	{@const st = data.summary.storage}
 	<div
-		class="card mb-4 border {st.startedEmpty || st.refusedWrites || st.recoveredFrom
+		class="card mb-4 border {!st.ready || st.error
 			? 'border-error/40 bg-error/5'
 			: 'border-white/5 bg-base-100/40'}"
 	>
 		<div class="card-body p-3 gap-1 text-xs">
 			<div class="flex items-center gap-2 font-bold text-sm">
 				<span>💾 Storage</span>
-				{#if st.startedEmpty}
-					<span class="badge badge-sm badge-error font-bold">started empty</span>
-				{:else if st.recoveredFrom}
-					<span class="badge badge-sm badge-warning font-bold">recovered</span>
+				{#if !st.ready}
+					<span class="badge badge-sm badge-error font-bold">not connected</span>
+				{:else if st.error}
+					<span class="badge badge-sm badge-warning font-bold">degraded</span>
 				{:else}
-					<span class="badge badge-sm badge-success font-bold">loaded</span>
+					<span class="badge badge-sm badge-success font-bold">connected</span>
 				{/if}
 			</div>
 			<div class="text-base-content/60 flex flex-wrap gap-x-5 gap-y-1">
-				<span><span class="font-mono">{st.path}</span></span>
-				{#if st.bytes != null}<span>{(st.bytes / 1024).toFixed(0)} KB</span>{/if}
-				<span>{formatGold(st.usersAtLoad)} account(s) at load</span>
-				<span>backup: {st.hasBackup ? 'yes' : 'not yet'}</span>
-				{#if st.allowReset}<span class="text-warning font-mono">ALLOW_DB_RESET=1</span>{/if}
+				<span class="font-mono">{st.serverVersion ?? 'postgres'}</span>
+				{#if st.database}<span
+						>db <span class="font-mono">{st.database}</span
+						>{#if st.host}<span class="opacity-60"> @ {st.host}</span>{/if}</span
+					>{/if}
+				{#if st.bytes != null}<span>{(st.bytes / 1024 / 1024).toFixed(1)} MB</span>{/if}
+				<span>{formatGold(st.usersAtBoot)} account(s) at boot</span>
+				{#if st.pool}
+					<span
+						>pool {st.pool.total} open, {st.pool.idle} idle{#if st.pool.waiting}, <span
+								class="text-warning">{st.pool.waiting} waiting</span
+							>{/if}</span
+					>
+				{/if}
 			</div>
-			{#if st.startedEmpty}
+			{#if !st.ready}
 				<p class="text-error mt-1">
-					No database was found at that path on this boot. On a deployment that already had
-					accounts, that means the volume is <strong>not mounted</strong> — mount Azure Files at
-					<span class="font-mono">/app/.data</span> and restart. Nothing has been written yet, so
-					the existing data is still intact; it will stay that way until someone changes something.
+					The app is not connected to Postgres. Check <span class="font-mono">DATABASE_URL</span>
+					and that the database container is up.
 				</p>
 			{/if}
-			{#if st.recoveredFrom}
+			{#if st.error}
 				<p class="text-warning mt-1">
-					The main file was unusable and the data came from a backup. The bad file was kept at
-					<span class="font-mono">{st.recoveredFrom}</span>.
+					Last database error: <span class="font-mono">{st.error}</span>
 				</p>
 			{/if}
-			{#if st.refusedWrites}
-				<p class="text-error mt-1">
-					Refused {st.refusedWrites} write(s) that would have erased accounts this process never
-					loaded. Nothing is being saved right now — fix the mount and restart.
+			{#if st.imported}
+				<p class="text-success mt-1">
+					Imported a legacy database from
+					<span class="font-mono">{st.imported.source}</span> on this boot:
+					{formatGold(st.imported.inDatabase?.users ?? 0)} account(s),
+					{formatGold(st.imported.inDatabase?.cards ?? 0)} card(s). The source file was left
+					untouched.
 				</p>
 			{/if}
 		</div>

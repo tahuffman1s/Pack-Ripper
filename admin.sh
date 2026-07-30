@@ -3,10 +3,9 @@
 # PackRipper admin commands.
 #
 # A thin wrapper around scripts/admin.mjs, which talks to the running app over
-# HTTP and authenticates with ADMIN_TOKEN. It does NOT edit .data/db.json:
-# db.js keeps the database in memory and rewrites all of it on every mutation, so
-# an edit made behind the app's back is overwritten by the next thing a player
-# does. The app has to make the change for it to stick.
+# HTTP and authenticates with ADMIN_TOKEN. It does NOT connect to Postgres
+# directly — going through the app means no database credentials here, the same
+# validation the panel gets, and one audit log for both.
 #
 #   ./admin.sh help                       every command
 #   ./admin.sh status                     health, totals, uptime
@@ -18,12 +17,13 @@
 #
 # First-time setup, once:
 #
-#   1. ./admin.sh token, and put ADMIN_TOKEN=<it> in .env (locally) or in the
-#      Container App's environment variables (Azure).
+#   1. ./admin.sh token, and put ADMIN_TOKEN=<it> in .env — the repo root one
+#      locally, or deploy/<host>/.env on a server.
 #   2. ADMIN_USERNAMES=<your username> in the same place, so you can reach the
 #      panel at /admin without needing the CLI at all. A fresh database has no
 #      admins and nothing in the UI can promote the first one.
-#   3. Restart the container. ./run.sh restart, or a new revision in Azure.
+#   3. Restart the container. ./run.sh restart, or `docker compose up -d` on a
+#      server.
 #
 # Flags handled here (everything else is passed straight through):
 #
@@ -31,9 +31,9 @@
 #                    on this machine. Automatic when node is not installed here.
 #                    Set PACKRIPPER_CONTAINER if it is not named `packripper`.
 #                    In the container the same CLI is on the PATH as `admin` — use
-#                    that directly from the Azure console. This script is not
+#                    that directly from a `docker exec` shell. This script is not
 #                    there (it is bash; the image is Alpine) and is not needed.
-#   --url URL        a remote app — the Azure hostname, say. Passed through.
+#   --url URL        a remote app — the public hostname, say. Passed through.
 
 set -euo pipefail
 

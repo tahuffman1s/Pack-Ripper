@@ -5,7 +5,7 @@ import { destroySession, SESSION_COOKIE } from '$lib/server/auth.js';
 export const actions = {
 	default: async ({ cookies }) => {
 		const token = cookies.get(SESSION_COOKIE);
-		destroySession(token);
+		await destroySession(token);
 		cookies.delete(SESSION_COOKIE, { path: '/' });
 		throw redirect(303, '/login');
 	}

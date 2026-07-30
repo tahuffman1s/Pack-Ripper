@@ -5,7 +5,7 @@
 #
 # The tunnel is off unless TUNNEL_TOKEN (or TUNNEL_TOKEN_FILE) is set, and with
 # it off this script does exactly what the old CMD did: exec node, which becomes
-# PID 1 and receives `docker stop` itself. Nothing about the Azure or Oracle
+# PID 1 and receives `docker stop` itself. Nothing about the Oracle or local
 # deployments changes.
 #
 # With it on, cloudflared dials OUT to Cloudflare and traffic returns down that

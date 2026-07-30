@@ -39,8 +39,11 @@ function forDisplay(c, images) {
 }
 
 /** @type {import('./$types').PageServerLoad} */
-export function load({ locals }) {
-	const raw = getCollection(locals.user.id);
+export async function load({ locals }) {
+	const [raw, value] = await Promise.all([
+		getCollection(locals.user.id),
+		collectionValue(locals.user.id)
+	]);
 
 	// Shared objects, not copies. SvelteKit serialises page data with devalue,
 	// which emits a repeated *reference* once — so the sixteen copies of a common
@@ -63,9 +66,5 @@ export function load({ locals }) {
 		.map((code) => ({ code, name: setEntry(code)?.name || String(code).toUpperCase() }))
 		.sort((a, b) => a.name.localeCompare(b.name));
 
-	return {
-		cards,
-		sets,
-		value: collectionValue(locals.user.id)
-	};
+	return { cards, sets, value };
 }

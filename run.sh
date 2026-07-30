@@ -2,23 +2,30 @@
 #
 # PackRipper container runner — local only.
 #
-# Public hosting lives in Azure Container Apps now, managed in the Portal (the
-# README lists the settings it needs). This script runs the same image on this
-# machine. It drives podman or docker directly rather than compose, because
-# podman ships without a compose provider and this machine has none: `podman
-# compose` here fails with "looking up compose provider failed".
-# docker-compose.yml is still in the repo for anyone who does have one. This
-# script needs neither.
+# Public hosting is a Raspberry Pi behind a Cloudflare Tunnel; see deploy/pi/.
+# This script runs the same image on this machine. It drives podman or docker
+# directly rather than compose, because podman ships without a compose provider
+# and this machine has none: `podman compose` here fails with "looking up compose
+# provider failed". docker-compose.yml is still in the repo for anyone who does
+# have one. This script needs neither.
 #
-#   ./run.sh              start the app on http://localhost:PORT
-#   ./run.sh down         stop and remove the container
-#   ./run.sh logs         follow the container's log
-#   ./run.sh restart      down, then up again (keeps .data and .cache)
+# TWO containers now, on a private network: the app, and the Postgres that holds
+# every account. The database lives in a named VOLUME, not a bind mount, so
+# `./run.sh down` and `restart` cannot lose it — only `./run.sh reset` can, and it
+# asks first.
+#
+#   ./run.sh              start Postgres and the app on http://localhost:PORT
+#   ./run.sh down         stop and remove both containers (KEEPS the database)
+#   ./run.sh logs         follow the app's log     (./run.sh logs db for Postgres)
+#   ./run.sh restart      down, then up again
 #   ./run.sh build        rebuild the image
 #   ./run.sh pull         fetch the image from GHCR instead of building it
+#   ./run.sh psql         open psql against the running database
+#   ./run.sh dump [FILE]  pg_dump to a file (default: packripper-<date>.sql)
+#   ./run.sh reset        DESTROY the database volume and start over
 #   ./run.sh url          print the local URL
 #   ./run.sh status
-#   ./run.sh shell        a shell inside the running container
+#   ./run.sh shell        a shell inside the running app container
 #
 # Flags: --build forces an image rebuild before starting.
 
@@ -29,6 +36,12 @@ cd "$(dirname "$SELF")"
 
 DEFAULT_IMAGE=packripper:latest
 APP=packripper
+DB=packripper-db
+NET=packripper
+# The database, deliberately outside the container lifecycle. Removing a container
+# must never be able to remove the accounts.
+DB_VOLUME=packripper-pgdata
+DB_IMAGE=postgres:17-alpine
 
 # ── output ─────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -84,6 +97,17 @@ BODY_SIZE_LIMIT="${BODY_SIZE_LIMIT:-2M}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 ADMIN_USERNAMES="${ADMIN_USERNAMES:-}"
 
+# Postgres. Defaulted rather than required, unlike the Pi: this database is bound
+# to loopback on a development machine. Override in .env if you care.
+POSTGRES_USER="${POSTGRES_USER:-packripper}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-packripper}"
+POSTGRES_DB="${POSTGRES_DB:-packripper}"
+# Host port, so psql and scripts/import-json-db.js can reach it from outside the
+# container. 5432 inside is fixed; this only moves the published one.
+PGPORT="${PGPORT:-5432}"
+# `$DB` resolves over the user-defined network below; 5432 is the container port.
+DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${DB}:5432/${POSTGRES_DB}"
+
 # Set IMAGE (in .env or the environment) to ghcr.io/tahuffman1s/pack-ripper:latest
 # to run the published image instead of a locally built one.
 IMAGE="${IMAGE:-$DEFAULT_IMAGE}"
@@ -128,6 +152,77 @@ ensure_image() {
 	if is_remote_image; then pull_image; else build_image; fi
 }
 
+# ── network ────────────────────────────────────────────────────
+# A user-defined network, because that is what gives containers DNS: on it the app
+# resolves `packripper-db` by name. The default bridge does not do that, and
+# hardcoding an IP would break on every restart.
+ensure_network() {
+	$ENGINE network inspect "$NET" >/dev/null 2>&1 && return 0
+	say "creating network $NET"
+	$ENGINE network create "$NET" >/dev/null
+	ok "network created"
+}
+
+# ── database ───────────────────────────────────────────────────
+ensure_db_volume() {
+	$ENGINE volume inspect "$DB_VOLUME" >/dev/null 2>&1 && return 0
+	say "creating volume $DB_VOLUME"
+	$ENGINE volume create "$DB_VOLUME" >/dev/null
+	ok "volume created"
+}
+
+start_db() {
+	ensure_network
+	ensure_db_volume
+
+	if running "$DB"; then
+		ok "database already up"
+		return 0
+	fi
+	if exists "$DB"; then $ENGINE rm -f "$DB" >/dev/null; fi
+
+	say "starting $DB"
+	# No --user here, unlike the app. The postgres entrypoint starts as root
+	# specifically so it can chown its data directory and then step down to the
+	# postgres user itself; forcing a uid stops it doing either and initdb fails.
+	$ENGINE run -d \
+		--name "$DB" \
+		--restart unless-stopped \
+		--network "$NET" \
+		--publish "127.0.0.1:${PGPORT}:5432" \
+		--env "POSTGRES_USER=${POSTGRES_USER}" \
+		--env "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" \
+		--env "POSTGRES_DB=${POSTGRES_DB}" \
+		--volume "${DB_VOLUME}:/var/lib/postgresql/data" \
+		"$DB_IMAGE" >/dev/null
+	ok "database container up"
+}
+
+db_ready() {
+	$ENGINE exec "$DB" pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q 2>/dev/null
+}
+
+# The app exits if it cannot reach Postgres, and it retries for 30s before doing
+# so — but waiting here means a first run does not spend those retries printing
+# alarming lines about a database that is merely still running initdb.
+wait_for_db() {
+	say "waiting for Postgres"
+	local i
+	for i in $(seq 1 90); do
+		if db_ready; then
+			ok "database ready after ${i}s"
+			return 0
+		fi
+		if ! running "$DB"; then
+			$ENGINE logs --tail 30 "$DB" >&2 || true
+			die "the database container stopped while starting"
+		fi
+		sleep 1
+	done
+	$ENGINE logs --tail 30 "$DB" >&2 || true
+	die "Postgres did not become ready within 90s"
+}
+
 # ── app ────────────────────────────────────────────────────────
 start_app() {
 	mkdir -p .data .cache
@@ -143,8 +238,10 @@ start_app() {
 		--name "$APP" \
 		--restart unless-stopped \
 		--publish "127.0.0.1:${PORT}:3000" \
+		--network "$NET" \
 		"${USER_ARGS[@]}" \
 		--env "NODE_ENV=production" \
+		--env "DATABASE_URL=${DATABASE_URL}" \
 		--env "HOST=0.0.0.0" \
 		--env "PORT=3000" \
 		--env "BODY_SIZE_LIMIT=${BODY_SIZE_LIMIT}" \
@@ -184,24 +281,55 @@ wait_for_app() {
 }
 
 print_url() {
-	printf '\n  %sLocal:%s  http://localhost:%s\n' "$B" "$N" "$PORT"
-	printf '  %s(public hosting is Azure Container Apps — see the README)%s\n\n' "$DIM" "$N"
+	printf '\n  %sLocal:%s     http://localhost:%s\n' "$B" "$N" "$PORT"
+	printf '  %sPostgres:%s  postgres://%s@localhost:%s/%s\n' "$B" "$N" "$POSTGRES_USER" "$PGPORT" "$POSTGRES_DB"
+	printf '  %s(public hosting is a Raspberry Pi — see deploy/pi/)%s\n\n' "$DIM" "$N"
 }
 
 # ── commands ───────────────────────────────────────────────────
 cmd_up() {
 	ensure_image
+	start_db
+	wait_for_db
 	start_app
 	wait_for_app
 	print_url
 }
 
+# Removes the containers and leaves the volume alone. That asymmetry is the point:
+# `down` is something you type a dozen times a day and it must not be the command
+# that loses every account. `reset` is the one that can.
 cmd_down() {
 	if exists "$APP"; then $ENGINE rm -f "$APP" >/dev/null && ok "removed $APP"; fi
+	if exists "$DB"; then $ENGINE rm -f "$DB" >/dev/null && ok "removed $DB (volume $DB_VOLUME kept)"; fi
+}
+
+cmd_reset() {
+	printf 'This deletes volume %s and every account in it. Type "yes" to go ahead: ' "$DB_VOLUME"
+	local answer; read -r answer
+	[ "$answer" = yes ] || die "cancelled"
+	cmd_down
+	$ENGINE volume rm "$DB_VOLUME" >/dev/null 2>&1 && ok "volume removed" || warn "no volume to remove"
+	cmd_up
+}
+
+cmd_psql() {
+	running "$DB" || die "the database is not running — ./run.sh up first"
+	$ENGINE exec -it "$DB" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+}
+
+cmd_dump() {
+	running "$DB" || die "the database is not running — ./run.sh up first"
+	local out=${1:-packripper-$(date +%Y%m%d-%H%M%S).sql}
+	say "dumping to $out"
+	# --clean --if-exists so the dump can be replayed over an existing database
+	# without hand-dropping it first.
+	$ENGINE exec "$DB" pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists > "$out"
+	ok "wrote $out ($(du -h "$out" | cut -f1))"
 }
 
 cmd_status() {
-	$ENGINE ps --filter "name=${APP}" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+	$ENGINE ps --filter "name=${APP}" --filter "name=${DB}" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 }
 
 usage() { sed -n '/^# PackRipper container runner/,/^set -euo/p' "$0" | sed '/^set -euo/d; s/^# \?//'; }
@@ -222,9 +350,12 @@ case "${1:-up}" in
 	up | local) cmd_up ;;
 	down | stop) cmd_down ;;
 	restart) cmd_down; cmd_up ;;
+	reset)   cmd_reset ;;
 	build)   [ -n "$FORCE_BUILD" ] || build_image ;;
 	pull)    pull_image ;;
-	logs)    $ENGINE logs -f "$APP" ;;
+	psql)    cmd_psql ;;
+	dump)    cmd_dump "${2:-}" ;;
+	logs)    if [ "${2:-}" = db ]; then $ENGINE logs -f "$DB"; else $ENGINE logs -f "$APP"; fi ;;
 	url)     print_url ;;
 	status)  cmd_status ;;
 	shell)   $ENGINE exec -it "$APP" sh ;;

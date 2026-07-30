@@ -11,8 +11,13 @@ vite.config.ts.timestamp-*
 .env.*
 !.env.example
 
-# Runtime database. Holds real password hashes, salts and live session tokens
-# for every registered account — never commit it, even to a private repo.
+# Postgres's data directory, when compose is pointed at a bind mount rather than
+# a named volume. This IS the database — password hashes, salts, live session
+# tokens — so never commit it, even to a private repo.
+/.pgdata
+
+# The legacy JSON database, kept only as an import source. Same contents, same
+# rule. Also matches the .bak/.tmp/.corrupt-* files the old loader left behind.
 /.data
 
 # Downloaded API caches: Scryfall pools/prints, MTGJSON collation slices, and
@@ -23,8 +28,19 @@ vite.config.ts.timestamp-*
 # The same two, on a host that runs the app from a checkout of this repo beside
 # deploy/<host>/compose.yml. The rules above are anchored to the repo root and so
 # do not reach them.
+deploy/*/.pgdata
 deploy/*/.data
 deploy/*/.cache
+
+# update.sh's scratch: the lock it takes so a timer and a person cannot update at
+# once, and the list of image IDs that failed to start here and were rolled back.
+# Both are facts about one machine, not about the repo.
+deploy/*/.update.lock
+deploy/*/.update-skip
+
+# pg_dump output from `./run.sh dump`, which lands in the repo root by default.
+packripper-*.sql
+packripper-*.sql.gz
 
 # Logs
 *.log

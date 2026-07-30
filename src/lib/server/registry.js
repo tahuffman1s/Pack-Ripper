@@ -71,7 +71,7 @@ export async function ensureSets() {
 			// The floors have to be warmed by something other than a page visit. They
 			// are what stops a 1993 booster being priced by the MSRP heuristic, which
 			// puts an Alpha pack at $43 next to singles worth thousands, and .cache is
-			// deliberately not mounted in Azure — so every revision starts cold.
+			// was deliberately not mounted on the old Azure host — so every revision started cold.
 			warmSealed(storeList)
 				.catch((e) => console.error('warmSealed failed:', e))
 				.then(() => warmVintageEv(storeList))
