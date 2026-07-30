@@ -20,6 +20,12 @@ vite.config.ts.timestamp-*
 # and goes stale — regenerated data, not source.
 /.cache
 
+# The same two, on a host that runs the app from a checkout of this repo beside
+# deploy/<host>/compose.yml. The rules above are anchored to the repo root and so
+# do not reach them.
+deploy/*/.data
+deploy/*/.cache
+
 # Logs
 *.log
 npm-debug.log*

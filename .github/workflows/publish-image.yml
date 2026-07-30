@@ -3,24 +3,30 @@
 #
 #   ghcr.io/tahuffman1s/pack-ripper:latest
 #
-# That is the whole pipeline. Nothing here deploys: the Azure Container App is
-# managed by hand, and a new tag in the registry does not restart it on its own —
-# see the run summary, which prints the exact strings the Portal asks for.
+# That is the whole pipeline. Nothing here deploys: the hosts are managed by
+# hand, and a new tag in the registry does not restart anything on its own — see
+# the run summary, which prints the exact strings each one asks for.
 #
 # GHCR needs no secrets — the automatic GITHUB_TOKEN can write packages as long
 # as the job asks for the permission below. The package took this repo's public
 # visibility and pulls anonymously; if a fork finds it private instead, flip it
 # at github.com/users/<you>/packages/container/pack-ripper/settings.
+#
+# The image is a two-platform manifest list, because the cheap places to run it
+# are ARM (Oracle Ampere, Hetzner CAX) and the dev machine is x86. Each platform
+# builds on a runner of its own architecture rather than under QEMU: `npm ci`
+# plus the vite build emulate badly enough to take a 3-minute job past 20.
 name: image
 
 on:
   push:
     branches: [main]
     tags: ['v*']
-    # The image contains none of this, so a doc edit should not spend five
-    # minutes rebuilding it.
+    # The image contains none of this, so editing a doc or a host's compose file
+    # should not spend minutes rebuilding it.
     paths-ignore:
       - 'README.md'
+      - 'deploy/**'
   workflow_dispatch:
 
 concurrency:
@@ -28,13 +34,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      # One architecture failing should still leave the other's log to read.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          # Free for public repos since 2025, and for private ones since
+          # January 2026. If this label ever fails to resolve, the fallback is
+          # docker/setup-qemu-action and a single job building both platforms.
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      # GHCR rejects an uppercase path and this repo is Pack-Ripper.
+      # metadata-action lowercases whatever it is given, but `outputs:` below
+      # needs the bare name too, and that is not an expression bash can touch —
+      # so lowercase it once, here, and use it in both places.
+      - id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -44,40 +71,103 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # GHCR rejects an uppercase path, and this repo is Pack-Ripper —
-      # metadata-action lowercases `images` for us, which is the whole reason to
-      # route the name through it rather than interpolating it inline.
+      # Only the labels are used here; the tags belong on the manifest list, not
+      # on either half of it.
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.name.outputs.image }}
+
+      # push-by-digest leaves these two images untagged in the registry. That is
+      # deliberate: tagging each one would mean `latest` briefly pointing at a
+      # single architecture, and whichever job finished last would win.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ steps.name.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          # Separate scopes, or the two architectures evict each other's layers.
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # The digest is the only thing the merge job needs, and an empty file named
+      # after it is the cheapest way to hand one job's string to another.
+      - name: Save the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # The tags land here, on a manifest list pointing at both digests. `docker
+  # pull` on either architecture then resolves to the right half by itself,
+  # which is the entire point of doing it this way.
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
             type=sha,format=short
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # amd64 only. Adding linux/arm64 works but runs `npm ci` and the vite
-          # build under QEMU emulation, which takes it from ~3 minutes to ~20.
-          platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create the manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+          METADATA: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          refs=()
+          for digest in *; do refs+=("$IMAGE@sha256:$digest"); done
+          # Word splitting on the jq output is what turns one string into the
+          # several -t arguments imagetools wants, so it must stay unquoted.
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$METADATA") \
+            "${refs[@]}"
 
-      # Deploying is manual, so the summary is written to be pasted from: the
-      # Portal's "create a new revision" form asks for the registry, the image
-      # and tag, and the target port as three separate fields.
+      # Deploying is manual, so the summary is written to be pasted from.
       - name: Summary
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
           # The immutable one. Deploying `latest` works but leaves you unable to
-          # tell which build a running revision actually is.
+          # tell which build a running host actually is.
           sha_tag=sha-${GITHUB_SHA:0:7}
           image=ghcr.io/${GITHUB_REPOSITORY,,}
           {
@@ -87,7 +177,17 @@ jobs:
             echo "$TAGS"
             echo '```'
             echo
+            echo 'linux/amd64 + linux/arm64.'
+            echo
             echo '### To deploy this build'
+            echo
+            echo 'On a host running `deploy/oracle/compose.yml`:'
+            echo
+            echo '```'
+            echo "TAG=$sha_tag docker compose up -d"
+            echo '```'
+            echo
+            echo 'On Azure Container Apps, create a new revision — it does not pull a new tag by itself:'
             echo
             echo '| Portal field | Value |'
             echo '| --- | --- |'
@@ -96,6 +196,4 @@ jobs:
             echo '| Authentication | Public |'
             echo "| Image and tag | \`${image#ghcr.io/}:$sha_tag\` |"
             echo '| Target port | `3000` |'
-            echo
-            echo "Container Apps does not pull a new tag by itself — create a new revision."
           } >> "$GITHUB_STEP_SUMMARY"

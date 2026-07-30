@@ -1,0 +1,27 @@
+# Caddy gets a certificate for $DOMAIN from Let's Encrypt on first start and
+# renews it forever, with no flags and no cron job. That is the only reason it is
+# here rather than nginx.
+#
+# Naming the site (rather than using :80) is what turns automatic HTTPS on: Caddy
+# needs a hostname to put on a certificate, and will redirect http:// to https://
+# by itself once it has one.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# `app` is the compose service name, resolved on the compose network.
+	reverse_proxy app:3000 {
+		# The app is behind TLS it cannot see. adapter-node reads this to decide
+		# whether a cookie may be marked Secure. (X-Forwarded-Host needs no line
+		# of its own — Caddy passes the original Host through by default, and
+		# `caddy validate` warns if you set it anyway.)
+		header_up X-Forwarded-Proto https
+
+		# A cold container spends up to two minutes fetching the Scryfall set
+		# list and probing sealed prices before it binds the port at all, and
+		# Caddy's answer to a refused connection is a 502 after ~1s. Retry the
+		# dial for three minutes instead, so the first request after a deploy
+		# waits for the app rather than failing in front of whoever made it.
+		lb_try_duration 180s
+		lb_try_interval 2s
+	}
+}

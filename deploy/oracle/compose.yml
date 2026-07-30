@@ -1,0 +1,72 @@
+# PackRipper on an Oracle Cloud Always Free ARM instance.
+#
+# Two containers: the app, and Caddy in front of it for TLS. Oracle gives you a
+# VM and a public IP and nothing else — no managed ingress, no certificate — so
+# the thing Azure Container Apps did for free is this file's second service.
+#
+# Copy this directory to the VM, fill in .env, and:
+#
+#   docker compose up -d
+#
+# See ../../README.md § Hosting it on Oracle Cloud for the console steps that
+# have to happen first.
+
+name: packripper
+
+services:
+  app:
+    image: ghcr.io/tahuffman1s/pack-ripper:${TAG:-latest}
+    container_name: packripper
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-2M}
+      # SvelteKit rejects any POST whose Origin header disagrees with the origin
+      # it thinks it is serving. Caddy terminates TLS and forwards plain HTTP, so
+      # the app cannot work this out for itself: it must be told the public
+      # https:// name, or pages load fine and every login and purchase fails.
+      ORIGIN: https://${DOMAIN}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      ADMIN_USERNAMES: ${ADMIN_USERNAMES:-}
+    volumes:
+      # Bind mounts rather than named volumes, because .data is the entire
+      # database and a thing you back up is a thing you should be able to find.
+      # Both sit on the VM's own block storage — the whole reason a VM is a
+      # better fit than Container Apps, where .cache had to stay off the Azure
+      # Files mount to avoid reading 30,000 small files over SMB.
+      - ./.data:/app/.data
+      - ./.cache:/app/.cache
+    # Not `ports:`. 3000 is reachable from Caddy over the compose network and
+    # from nowhere else, so there is no unencrypted way in from the internet.
+    # The admin CLI still works — it runs inside the container over loopback:
+    #   docker exec -it packripper admin list
+    expose:
+      - '3000'
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    depends_on: [app]
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      # 80 as well as 443, and not only as a redirect: it is where Let's Encrypt
+      # answers its own HTTP-01 challenge. Closing it means no certificate and,
+      # 60 days later, no renewal.
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The issued certificate and its account key. Without this volume Caddy
+      # requests a fresh certificate on every restart and will hit Let's
+      # Encrypt's rate limit (5 per name per week) about as fast as you can
+      # redeploy.
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

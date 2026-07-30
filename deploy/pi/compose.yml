@@ -1,0 +1,64 @@
+# PackRipper on a Raspberry Pi, published through a Cloudflare Tunnel.
+#
+# One service. cloudflared is in the image and starts beside the app whenever
+# TUNNEL_TOKEN is set, so there is no sidecar here and no second container to
+# keep in step — see ../../scripts/docker-entrypoint.sh.
+#
+# Nothing here publishes a port. cloudflared makes an OUTBOUND connection to
+# Cloudflare and traffic comes back down it, so there is no port forward on the
+# router, no inbound hole in the firewall, and no certificate to renew — the app
+# is reachable on the container's own loopback by cloudflared and by nothing
+# else on earth. That is a better security posture than the Oracle setup next
+# door, not a worse one.
+#
+#   cp .env.example .env && vi .env && docker compose up -d
+#
+# See ../../README.md § Hosting it on a Raspberry Pi. Read the DATA_DIR note
+# there before running this off an SD card.
+
+name: packripper
+
+services:
+  app:
+    # A manifest list since the arm64 half was added, so this pulls the right
+    # architecture on a Pi with no `platform:` override. 64-bit OS required —
+    # there is no armv7 build and there is not going to be one.
+    image: ghcr.io/tahuffman1s/pack-ripper:${TAG:-latest}
+    container_name: packripper
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      BODY_SIZE_LIMIT: ${BODY_SIZE_LIMIT:-2M}
+      # The public name Cloudflare serves, not the Pi's LAN address. SvelteKit
+      # rejects any POST whose Origin disagrees with the origin it believes it is
+      # serving, and cloudflared forwards plain HTTP — so the app cannot work
+      # this out for itself. Wrong value: pages load, every login and purchase
+      # fails.
+      ORIGIN: https://${DOMAIN}
+      # Setting this is what switches the tunnel on. `:?` so a missing token
+      # fails loudly at `up` instead of leaving a container restarting in a loop
+      # with the reason buried in its logs.
+      #
+      # A token-based ("remote") tunnel: the hostname, the route and the origin
+      # URL all live in the Cloudflare dashboard, so there is no ingress config
+      # file here to drift out of sync with it. The origin URL to give it there
+      # is http://localhost:3000 — the app shares this container now rather than
+      # sitting across a compose network, so a service name will not resolve.
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env — copy it from the Cloudflare dashboard}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      ADMIN_USERNAMES: ${ADMIN_USERNAMES:-}
+    volumes:
+      # Both default to beside this file, and both should be pointed at an SSD if
+      # this Pi boots off an SD card. db.js rewrites the WHOLE database on every
+      # mutation — every slot spin, every blackjack hit — and that file is
+      # already megabytes. See the README; this is the one setting on a Pi that
+      # decides whether the storage survives the year.
+      - ${DATA_DIR:-./.data}:/app/.data
+      - ${CACHE_DIR:-./.cache}:/app/.cache
+    # Not `ports:`. Add `- "3000:3000"` only if you want it on the LAN too.
+    # The admin CLI does not need it — it runs inside the container on loopback:
+    #   docker exec -it packripper admin list
+    expose:
+      - '3000'

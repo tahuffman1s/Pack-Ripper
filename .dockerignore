@@ -23,8 +23,11 @@ package
 README.md
 scripts
 # …except the admin CLI, which the runtime stage copies to /app/admin.mjs so it
-# can be run with `exec` on a host that has no checkout.
+# can be run with `exec` on a host that has no checkout, and the two shell
+# scripts the image's ENTRYPOINT and HEALTHCHECK are.
 !scripts/admin.mjs
+!scripts/docker-entrypoint.sh
+!scripts/docker-healthcheck.sh
 
 .env
 .env.*
@@ -35,9 +38,10 @@ Dockerfile
 docker-compose.yml
 run.sh
 
-# CI config and the Azure deployment scripts. Neither is part of the app.
+# CI config and the per-host compose files. Neither is part of the app, and both
+# change without the image needing to.
 .github
-azure
+deploy
 
 *.log
 *.save

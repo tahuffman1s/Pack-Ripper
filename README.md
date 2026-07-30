@@ -314,11 +314,38 @@ involved — the workflow's automatic `GITHUB_TOKEN` can write packages. Two thi
 - **It is public because the repo is**, and pulls anonymously with no login. If you ever find
   it private — GHCR does not always inherit — flip it under your profile → Packages →
   `pack-ripper` → Package settings → Change visibility.
-- **`linux/amd64` only.** Adding `linux/arm64` to `platforms:` works, but `npm ci` and the
-  vite build then run under QEMU and the job goes from ~3 minutes to ~20.
+- **`linux/amd64` and `linux/arm64`**, as one manifest list — `docker pull` resolves to the right
+  half on its own. Each is built on a runner of its own architecture (`ubuntu-latest` and
+  `ubuntu-24.04-arm`) and merged by digest in a second job, because building arm64 under QEMU
+  takes `npm ci` and the vite build from ~3 minutes to ~20. ARM matters because the cheap places
+  to run this are ARM — see [Oracle](#hosting-it-on-oracle-cloud), below.
 
 Set `IMAGE=ghcr.io/tahuffman1s/pack-ripper:latest` in `.env` and `run.sh` uses the published
 image everywhere, pulling it instead of building when it is missing.
+
+### The tunnel is in the image
+
+`cloudflared` ships inside it, so a host with no inbound port to open can publish the app with
+one container and no sidecar. It is **off unless `TUNNEL_TOKEN` (or `TUNNEL_TOKEN_FILE`) is
+set** — Azure and Oracle terminate their own TLS and never start it.
+
+- **Nothing changes when it is off.** `scripts/docker-entrypoint.sh` execs `node` straight away,
+  so it is PID 1 and takes `docker stop` itself, exactly as before the tunnel existed. A one-off
+  `docker run … admin list` is passed through untouched too, token or no token.
+- **When it is on**, cloudflared starts beside the app and reaches it over the container's own
+  loopback — so the tunnel's origin URL in the Cloudflare dashboard is `http://localhost:3000`.
+- **Either half dying takes the container down**, so `restart: unless-stopped` gets its chance.
+  A tunnel that quietly died would otherwise leave a container that looks perfectly healthy and
+  is reachable by nobody.
+- **The healthcheck checks both**: `/api/health` on loopback, and, only when a token is set,
+  cloudflared's own `/ready` on its loopback-bound metrics port.
+- **The binary is pinned** in the Dockerfile rather than tracking `latest`, and is copied out of
+  Cloudflare's own image so each build gets its own architecture without naming one. It costs
+  ~39 MB, which is most of why the image grew from ~174 MB to ~216 MB.
+
+The `--no-autoupdate` flag matters more here than in a sidecar: cloudflared's updater rewrites
+its own binary and restarts itself, which inside a container is both futile and a restart nobody
+asked for. Bump the pinned version deliberately instead.
 
 ## Hosting it in Azure
 
@@ -414,6 +441,284 @@ Deploy the `sha-<short>` tag rather than `latest`. Both point at the same build,
 immutable tag you can tell from the Portal which commit a revision is running, and a rollback is
 just creating a revision on an older tag — every one of them is still in the registry.
 
+## Hosting it on Oracle Cloud
+
+Container Apps costs $10–15 a month because always-on and consumption billing do not mix: the
+free grant is 180,000 vCPU-seconds, which at 0.5 vCPU is 100 hours, not a month. Oracle's
+**Always Free** tier is an actual VM, free indefinitely, and comfortably bigger than this app
+needs — 2 OCPU and 12 GB of Ampere ARM plus 200 GB of block storage.
+
+A VM also fixes the thing Azure made awkward. There is no SMB share here, so `.data` **and**
+`.cache` both live on local disk and the "do not mount `.cache`" rule stops applying.
+
+What you give up: Oracle terminates no TLS and hands out no hostname, so `deploy/oracle/` runs
+Caddy alongside the app to do both. And backups become yours.
+
+### What Oracle asks for, in order
+
+**1. An account, and a home region you cannot change.** Pick one near you with Ampere capacity;
+the home region is permanent. A card is required for identity verification and is not charged for
+always-free resources.
+
+**2. An instance.** Compute → Instances → Create:
+
+| Field | Value |
+|---|---|
+| Image | Canonical Ubuntu 24.04 |
+| Shape | **VM.Standard.A1.Flex** (Ampere, "Always Free-eligible") |
+| OCPUs / memory | 1 / 6 GB |
+| Boot volume | Default (~50 GB, inside the free 200) |
+| Public IPv4 | Assign |
+| SSH key | Save the private key — there is no second chance |
+
+Ask for 1 OCPU rather than the full 2: it is still six times this app's 1 GiB, and smaller
+requests are likelier to place. **"Out of host capacity" is the normal experience** on A1 — it
+means the region is full, not that anything is wrong. Retry, try another availability domain, or
+try again in a few hours.
+
+**3. Ingress for 80 and 443.** Instance → its subnet → its security list → Add ingress rules.
+Source `0.0.0.0/0`, TCP, destination port 80, then again for 443. Stateless: no.
+
+**4. The host firewall, which is the part that wastes an afternoon.** Oracle's Ubuntu images ship
+`iptables-persistent` with a rule rejecting everything except SSH, so a port opened in the console
+can still refuse connections. Docker's published ports are DNAT'd in `PREROUTING` and traverse
+`FORWARD` rather than `INPUT`, so they often work regardless — but check rather than assume, and
+adding the rules costs nothing:
+
+```bash
+sudo iptables -L INPUT --line-numbers          # find the REJECT rule's number
+sudo iptables -I INPUT <that number> -m state --state NEW -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT <that number> -m state --state NEW -p tcp --dport 443 -j ACCEPT
+sudo netfilter-persistent save                 # or they vanish on reboot
+```
+
+**5. Docker.**
+
+```bash
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker ubuntu                 # log out and back in
+sudo systemctl enable --now docker             # so it survives a reboot
+```
+
+**6. DNS.** Point an A record at the instance's public IP. Caddy proves control over that name
+over port 80 to get a certificate, so an IP alone will not do — Let's Encrypt does not issue for
+one. A free DuckDNS subdomain works.
+
+### Bringing it up
+
+```bash
+git clone https://github.com/tahuffman1s/Pack-Ripper.git
+cd Pack-Ripper/deploy/oracle
+cp .env.example .env
+vi .env                                        # DOMAIN is the only required value
+docker compose up -d
+```
+
+Only Caddy publishes ports; the app is reachable on the compose network and nowhere else, so
+there is no unencrypted route in from outside. The first boot takes a couple of minutes to fetch
+the Scryfall set list and probe sealed prices — the Caddyfile's `lb_try_duration` waits it out
+instead of returning a 502.
+
+The [admin CLI](#admin) runs inside the container, where the app is on loopback:
+
+```bash
+docker exec -it packripper admin status
+docker exec -it packripper admin gold travis 5000
+```
+
+`docker compose logs -f app` shows the same `db: loaded N account(s)` line described
+[above](#checking-that-the-database-is-actually-mounted) — with a bind mount on a real disk it is
+much harder to get wrong than a revision template, but it is still the line to read after a
+deploy.
+
+### Shipping a new build
+
+```bash
+vi .env                                        # TAG=sha-<short> from the Actions summary
+docker compose up -d                           # recreates only what changed
+docker image prune -f
+```
+
+`TAG=latest` with `docker compose pull && docker compose up -d` also works. Pinning the `sha-`
+tag is better for the same reason as on Azure: you can tell what is running, and rolling back is
+one line.
+
+### Two things Oracle will not do for you
+
+- **Idle reclamation.** Always Free compute can be reclaimed after seven days of low utilisation,
+  and a quiet hobby app qualifies. Upgrading the account to Pay As You Go exempts you and still
+  bills $0 for always-free resources — this is the single change worth making.
+- **Backups.** `.data/db.json` is every account, collection and wallet, and now it is on one disk
+  you own. The app keeps a `.bak` beside it, which survives a bad write but not a lost instance.
+  A daily copy off the box:
+
+  ```
+  0 4 * * * tar czf ~/backups/db-$(date +\%F).tar.gz -C ~/Pack-Ripper/deploy/oracle .data
+  ```
+
+  Oracle's own boot-volume backup policy (Storage → Block Volumes → the volume → Backups) covers
+  the instance dying, and is a click.
+
+## Hosting it on a Raspberry Pi
+
+The cheapest option that exists, if the Pi is already on: a few pence of electricity a month, no
+account with anyone, and nothing to reclaim your instance for being idle. `deploy/pi/` publishes
+it through a **Cloudflare Tunnel**, which is free and needs no router configuration.
+
+The tunnel is worth understanding, because it is the opposite of a port forward. `cloudflared`
+dials *out* to Cloudflare and traffic returns down that connection, so:
+
+- **No inbound port is open** on the router or the Pi. Nothing here publishes a port at all — the
+  app is reachable by `cloudflared` on the container's own loopback and by nothing else.
+- **No certificate to manage.** Cloudflare terminates TLS at its edge on your own hostname. This
+  is why there is no Caddy here and no port 80.
+- **Your home IP is not published** in DNS.
+
+`cloudflared` is [in the image](#the-tunnel-is-in-the-image), so `deploy/pi/compose.yml` is a
+single service and there is no sidecar to keep in step.
+
+### The installer
+
+`deploy/pi/install.sh` takes a fresh 64-bit Pi to a live public URL. On the Pi:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tahuffman1s/Pack-Ripper/main/deploy/pi/install.sh | bash
+```
+
+It checks the machine (64-bit, RAM, model), installs Docker and the compose plugin if they are
+missing and enables the service at boot, clones the repo, writes `deploy/pi/.env` at mode **0600**
+because it holds two credentials, brings the stack up, and waits — both for the app to answer and
+for the tunnel to report a live connection to Cloudflare, so a bad token is caught then and there
+rather than by you loading the site. Re-running it is safe: it keeps every answer already in
+`.env`, so an update is the same one line.
+
+It prompts for the tunnel token and the hostname, and prints the dashboard clicks that produce
+them. To skip the questions entirely:
+
+```bash
+./deploy/pi/install.sh -y --domain packripper.example.com --token <TOKEN> --admin-user you
+```
+
+Useful flags: `--dry-run` prints every command it would run and changes nothing; `--data-dir` and
+`--cache-dir` put the two volumes on a USB SSD; `--tag sha-<short>` pins a build; `--help` lists
+the rest. On a Pi booting from an SD card it says so, points out any other disk it can see, and
+lets you choose — it will not mount or format anything, because picking the wrong disk is not a
+mistake a convenience script gets to make.
+
+### Hourly backups to a Nextcloud
+
+`deploy/pi/backup.sh` tars `.data` and uploads it over WebDAV. The installer offers to set it up
+and runs it on an hourly **systemd timer** — `Persistent=true`, so a run missed while the Pi was
+off happens at the next boot rather than being skipped, and the output goes to the journal instead
+of to mail nobody reads. Answer the installer's question, or pass the values:
+
+```bash
+./deploy/pi/install.sh --nextcloud-url https://cloud.example.com \
+  --nextcloud-user you --nextcloud-pass <APP-PASSWORD> --nextcloud-path PackRipper
+```
+
+Use an **app password** (Settings → Security → Devices & sessions), not your login password: it
+lives in plain text in `.env`, and an app password can be revoked by itself. The installer proves
+the credentials work before it finishes and takes the first backup immediately — a backup that
+only fails at 3am is worse than none, because you believe you have one.
+
+**Retention needs no pruning.** Each run writes `db-hHH.tar.gz` for the current UTC hour, and the
+04:00 run also writes `db-dN.tar.gz` for the weekday. That is 24 hourly slots and 7 daily ones,
+each overwritten as it comes round again: the last day hour by hour, the last week day by day, 31
+files forever. The obvious alternative — timestamped names plus a prune step — needs PROPFIND and
+XML parsing to decide what to delete, and fails by silently filling the remote.
+
+A 4 MB database compresses to about 450 KB, so the whole remote folder is ~14 MB.
+
+```bash
+./deploy/pi/backup.sh --test        # check the credentials, upload nothing real
+./deploy/pi/backup.sh               # back up now
+sudo systemctl list-timers packripper-backup
+sudo journalctl -u packripper-backup -n 20
+```
+
+The unit runs as **root** deliberately: the container runs as root, so everything it writes into
+the bind-mounted `.data` is root-owned and an unprivileged unit could not read the database it is
+meant to be saving. No app downtime is needed either — `db.js` replaces `db.json` by `rename`, so
+`tar` sees either the old complete file or the new one, never half of one.
+
+To restore, download a slot and unpack it over `.data`:
+
+```bash
+cd ~/Pack-Ripper/deploy/pi
+sudo docker compose down
+tar xzf db-h14.tar.gz -C .data
+sudo docker compose up -d
+```
+
+The manual route still works and is four commands:
+
+```bash
+git clone https://github.com/tahuffman1s/Pack-Ripper.git
+cd Pack-Ripper/deploy/pi
+cp .env.example .env
+vi .env                                        # DOMAIN + TUNNEL_TOKEN
+docker compose up -d
+```
+
+### The token and the hostname
+
+The token comes from the Zero Trust dashboard → Networks → Tunnels → *Create a tunnel* →
+Cloudflared; it is the string after `--token` in the install command it offers. Then add a public
+hostname to that tunnel pointing at **`http://localhost:3000`**, which writes the CNAME for you —
+there is no DNS record to create by hand. Localhost, not a service name: the tunnel and the app
+share one container, and `http://app:3000` (what a sidecar would have used) resolves to nothing.
+
+**The domain has to be on Cloudflare first**, which is the one prerequisite that is not in this
+repo. Free plan, but it means adding the zone to a Cloudflare account and pointing the registrar's
+nameservers at the two they give you — wherever the domain is registered, Cloudflare has to be
+running its DNS. That is what lets a tunnel write its own CNAME, and it propagates in minutes to
+hours. If the domain is already on Cloudflare, there is nothing to do.
+
+Requirements are a **64-bit OS** (there is no armv7 build) and a Pi with 2 GB or more. A Pi 4 or 5
+is comfortable; a Zero 2 W is not.
+
+### The SD card problem, which is the real one
+
+`db.js` keeps the database in memory and rewrites **the entire file** on every mutation. That is
+the right design for a single process and it is what makes the app dependency-free, but on a Pi it
+has a consequence worth arithmetic:
+
+- `.data/db.json` is already **~4 MB**.
+- Every slot spin, every blackjack hit, every card sold is one full rewrite (debounced 60 ms, so
+  one action really is one write — `game.js` batches an opened box, but not a spin).
+- An hour of slots at a spin every two seconds is ~1,800 writes ≈ **7 GB**, all to one file.
+
+SD cards have no wear-levelling worth relying on. **Point `DATA_DIR` at a USB SSD**, or boot the
+Pi from one — it is the single setting here that decides whether the storage lasts. `.cache` is
+gentler (it is written once per set and then read), but it may as well go on the same disk.
+
+### Two smaller things
+
+- **A cold first boot can 524.** Cloudflare gives up on an origin after 100 seconds, and the very
+  first request with an empty `.cache` fetches the Scryfall set list and probes ~55 sets before it
+  answers. Warm it yourself before anyone else arrives, once per fresh `.cache`:
+
+  ```bash
+  docker compose exec app curl -fsS -o /dev/null http://127.0.0.1:3000/api/health
+  ```
+
+  Every later start reads the warm cache off disk and is quick.
+
+- **Uptime is your ISP's uptime**, and a power cut is a restart. `restart: unless-stopped` plus
+  Docker enabled at boot covers the reboot; the atomic write plus `db.json.bak` covers being
+  killed mid-flush. Back the file up off the Pi anyway — same cron as the Oracle section.
+
+### What Railway would have cost
+
+Railway meters real usage — $10/GB-month of memory and $20/vCPU-month — so the $30 figure you get
+by multiplying out a 1 vCPU / 1 GB allocation is a *fully saturated* container, not this one. A
+quiet Node app actually consuming ~300 MB and almost no CPU lands near $4, under the Hobby plan's
+$5 included credit. So Railway is realistically **the $5 plan minimum**, not $30.
+
+That is not outrageous for what it does — a git push deploys it and volumes are a checkbox. It is
+just $5 more than a Pi you already own, and $5 more than Oracle.
+
 ## Project layout
 
 ```
@@ -468,10 +773,22 @@ src/
 admin.sh                  admin commands, for the container host
 scripts/
   admin.mjs               the admin CLI itself (also shipped in the image)
+  docker-entrypoint.sh    the image's ENTRYPOINT: the app, + cloudflared if asked
+  docker-healthcheck.sh   the image's HEALTHCHECK: the app, + the tunnel if there is one
   verify-odds.mjs         odds regression harness vs published figures
   verify-slots.mjs        exact slot RTP / paytable verification
   verify-blackjack.mjs    hand evaluation, shuffle bias, measured house edge
   measure-sealed-premium.mjs  re-derives the vintage sealed premium from live prices
+deploy/
+  pi/
+    install.sh            fresh 64-bit Pi -> live public URL, re-runnable
+    backup.sh             hourly .data -> Nextcloud over WebDAV, self-rotating
+    compose.yml           one service: the app, with cloudflared inside it
+    .env.example
+  oracle/
+    compose.yml           the app + Caddy for TLS
+    Caddyfile
+    .env.example
 .github/workflows/
   publish-image.yml       build + push ghcr.io/tahuffman1s/pack-ripper
 ```
@@ -485,6 +802,13 @@ scripts/
 - Card data is cached for 14 days under `.cache/`; collation slices for 90 days (collation
   never changes once a set is released). Delete `.cache/` to refresh.
 - Admin access is `ADMIN_USERNAMES` and `ADMIN_TOKEN`, both off when unset — see [Admin](#admin).
+- **Shutdown is bounded, deliberately.** On SIGTERM the database is flushed at once, and the
+  process leaves as soon as adapter-node reports the HTTP server drained (`sveltekit:shutdown`) —
+  typically ~100 ms. It does not wait for the background price warming, which on a cold cache
+  runs for minutes of fetches and throttle timers and used to hold the process open long past
+  any container's stop grace; that work produces nothing but regenerable `.cache`. If the drain
+  itself never completes, `SHUTDOWN_GRACE_MS` (default 8000) leaves anyway, and the image sets
+  adapter-node's own `SHUTDOWN_TIMEOUT=5` so a request that will not finish is closed first.
 - **Vintage sealed prices depend on a computed floor.** A pre-2006 pack with no live TCGplayer
   listing is priced from the exact EV of its print sheets (`packvalue.js`), because the MSRP×age
   heuristic puts an Alpha booster at $43 against singles worth thousands. Those floors are warmed
