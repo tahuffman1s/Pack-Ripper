@@ -46,6 +46,18 @@ const ALLOW_RESET = process.env.ALLOW_DB_RESET === '1';
 /** How often to refresh the backup copy. Every flush would double SMB writes. */
 const BACKUP_EVERY_MS = 1000 * 60 * 5;
 
+/**
+ * How long a shutdown may take before this process stops being polite about it.
+ * Under a container's ten-second stop grace, so the exit is ours rather than a
+ * SIGKILL; see installShutdownFlush.
+ *
+ * Anything unparseable falls back rather than becoming NaN, which setTimeout
+ * would treat as "now" — turning a typo into a shutdown that abandons in-flight
+ * requests.
+ */
+const SHUTDOWN_GRACE_MS =
+	Number(process.env.SHUTDOWN_GRACE_MS) > 0 ? Number(process.env.SHUTDOWN_GRACE_MS) : 8000;
+
 const DEFAULT_DB = {
 	users: {}, // id -> { id, username, passwordHash, salt, createdAt, admin? }
 	usernames: {}, // lowercased username -> userId
@@ -291,25 +303,48 @@ export function flushSync() {
 
 let hooked = false;
 /**
- * Persist on shutdown. Idempotent, so importing this twice is harmless.
+ * Persist on shutdown, and make sure the shutdown actually finishes. Idempotent,
+ * so importing this twice is harmless.
  *
- * Deliberately does NOT exit: adapter-node registers its own SIGTERM handler that
- * drains in-flight requests before exiting, and Node runs every listener for a
- * signal. Flushing here and returning lets that drain happen; calling
- * process.exit() would cut it short and drop whatever was still being served.
+ * Flushing on the signal is the easy half. The half that was broken is that the
+ * process did not exit at all. adapter-node's own SIGTERM handler closes the HTTP
+ * server and then simply expects the event loop to empty — and this app's does
+ * not. Startup fires warmSealed() and warmVintageEv() into the background, and on
+ * a cold cache those spend minutes on outbound fetches and throttle timers, every
+ * one of which holds the process open. Measured: still running 122 seconds after
+ * SIGTERM. So every container stop ended in a SIGKILL, and the only reason the
+ * database survived that is that the flush below is synchronous.
  *
- * `exit` is the backstop, because it fires on an explicit process.exit() — which
- * is how adapter-node finishes — where `beforeExit` does not.
+ * Hence the two exits. `sveltekit:shutdown` is emitted by adapter-node from its
+ * httpServer.close() callback, which is precisely the moment when waiting longer
+ * buys nothing: in-flight requests have finished, and what is left is background
+ * work whose only product is regenerable cache. The timer is the backstop for
+ * that event never arriving — unref'd, so it can never hold up a process that was
+ * ready to leave on its own, which is exactly what an unref'd timer is for.
+ *
+ * Neither exit path flushes on its own, because process.exit() runs the `exit`
+ * listener below and that is one 4 MB write, not two. `exit` rather than
+ * `beforeExit` is what catches an explicit exit; both are registered because
+ * `beforeExit` is the one that catches a loop that empties by itself.
  */
 export function installShutdownFlush() {
 	if (hooked) return;
 	hooked = true;
+
+	const leave = (why) => {
+		console.log(`db: ${why} — exiting`);
+		process.exit(0);
+	};
+
 	for (const sig of ['SIGTERM', 'SIGINT']) {
 		process.on(sig, () => {
 			console.log(`db: ${sig} — flushing`);
 			flushSync();
+			setTimeout(() => leave('shutdown took too long'), SHUTDOWN_GRACE_MS).unref();
 		});
 	}
+	process.on('sveltekit:shutdown', () => leave('server drained'));
+
 	process.on('exit', flushSync);
 	process.on('beforeExit', flushSync);
 }
