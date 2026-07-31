@@ -576,3 +576,77 @@ export function poolIsUsable(pool) {
 	if (n >= 40 && rare.length + mythic.length < Math.max(4, n * 0.06)) return false;
 	return true;
 }
+
+// ── Card faces ─────────────────────────────────────────────────
+
+/**
+ * Both faces of one printing, for the 3D card viewer's flip.
+ *
+ * A stored card instance carries ONE image — the front — because that is all any
+ * screen needed until now. A transforming card, a modal double-faced card and a
+ * reversible printing all have a real second face, and the back of the card the
+ * player is holding is that face rather than a Magic card back.
+ *
+ * Deliberately its own tiny cache rather than a field added to the print records:
+ * the by-id store and the per-set print indexes already on disk were written
+ * without a faces field, so adding one would leave every card pulled before today
+ * without a back until its cache expired (and the by-id store has no expiry at
+ * all). One endpoint, one file, correct for every card ever pulled.
+ *
+ * A printing's faces never change, so entries never expire.
+ */
+const FACES_CACHE = () => join(PRINT_DIR, '_faces.json');
+let facesMemo = null;
+
+function loadFaces() {
+	if (facesMemo) return facesMemo;
+	try {
+		facesMemo = existsSync(FACES_CACHE()) ? JSON.parse(readFileSync(FACES_CACHE(), 'utf-8')) : {};
+	} catch {
+		facesMemo = {};
+	}
+	return facesMemo;
+}
+
+/** Ids Scryfall has confirmed it does not have. In-process; see byIdMisses. */
+const facesMisses = new Set();
+
+/**
+ * @returns {Promise<{layout:string, faces:{name:string,image:string|null}[]}|null>}
+ *   null when the id is unknown or unreachable. A single-faced card returns one
+ *   entry, which is the answer "there is no second face" rather than an error.
+ */
+export async function getCardFaces(id) {
+	if (!UUID_RE.test(String(id))) return null;
+	const store = loadFaces();
+	if (store[id]) return store[id];
+	if (facesMisses.has(id)) return null;
+
+	let card;
+	try {
+		card = await apiGet(`/cards/${id}`);
+	} catch (e) {
+		// A 404 is an answer worth remembering; anything else might be transient, and
+		// tombstoning on a blip would strip the back off a card for the whole process.
+		if (String(e.message).includes('404')) facesMisses.add(id);
+		return null;
+	}
+
+	const pick = (uris) => uris?.png || uris?.large || uris?.normal || null;
+	const faces = card.card_faces?.length
+		? card.card_faces.map((f) => ({
+				name: f.name || card.name,
+				image: pick(f.image_uris) || pick(card.image_uris)
+			}))
+		: [{ name: card.name, image: pick(card.image_uris) }];
+
+	const record = { layout: card.layout || 'normal', faces };
+	store[id] = record;
+	try {
+		ensureDirs();
+		writeFileSync(FACES_CACHE(), JSON.stringify(store));
+	} catch {
+		/* cache is best-effort */
+	}
+	return record;
+}

@@ -1,5 +1,16 @@
 import { fail, redirect } from '@sveltejs/kit';
 import { createUser, createSession, SESSION_COOKIE, sessionCookieOptions } from '$lib/server/auth.js';
+import { startingGold } from '$lib/server/settings.js';
+
+/**
+ * The opening grant is an admin setting now, so the sign-up page has to be told
+ * what it is rather than quoting the compiled constant — otherwise a server that
+ * hands out a million advertises a hundred thousand.
+ */
+/** @type {import('./$types').PageServerLoad} */
+export async function load() {
+	return { startingGold: await startingGold() };
+}
 
 /** @type {import('./$types').Actions} */
 export const actions = {

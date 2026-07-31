@@ -7,7 +7,7 @@
 		lit = new Set(),
 		/** Winning paylines to trace over the window: `{ line, rows }`. */
 		winLines = [],
-		/** How many paylines are being played, for the edge markers. */
+		/** How many paylines are being played, for the legend. */
 		lines = PAYLINES.length,
 		onlanded = () => {}
 	} = $props();
@@ -27,6 +27,17 @@
 	const SPIN_SPEED = 26; // stops per second while free-running
 	const EASE = 7; // approach rate once a reel has a target
 	const MAX_BLUR = 4.5; // px of motion blur at full speed
+
+	/**
+	 * When each reel starts easing to its target.
+	 *
+	 * Tighter than the three-reel machine's 0.85 + 0.36i: at five reels that pacing
+	 * put the last reel at 2.3 seconds, which is a long time to wait for a spin you
+	 * are going to repeat a hundred times. This lands the fifth reel at 1.6s and
+	 * keeps the left-to-right sequence a mechanical machine has.
+	 */
+	const FIRST_STOP = 0.7;
+	const STOP_GAP = 0.23;
 
 	const symbolAt = (reel, j) => REELS[reel][((j % STOPS) + STOPS) % STOPS];
 
@@ -125,7 +136,7 @@
 			r.target = null;
 			r.velocity = SPIN_SPEED + i * 2;
 			// Land left to right, the way a mechanical machine does.
-			r.stopAt = now + (quick ? 0.1 + i * 0.05 : 0.85 + i * 0.36);
+			r.stopAt = now + (quick ? 0.1 + i * 0.04 : FIRST_STOP + i * STOP_GAP);
 		});
 		if (!running && !disposed) {
 			running = true;
@@ -143,45 +154,37 @@
 	// The window is a gapless grid, so a cell centre is simply
 	// (reel + 0.5, row + 0.5) in viewBox units. Separation between the reels is
 	// drawn on top as posts rather than laid out as gaps, which keeps this honest.
-	const LINE_COLORS = ['#fbbf24', '#22d3ee', '#f472b6', '#a3e635', '#c084fc'];
+	const LINE_COLORS = [
+		'#fbbf24',
+		'#22d3ee',
+		'#f472b6',
+		'#a3e635',
+		'#c084fc',
+		'#fb923c',
+		'#38bdf8',
+		'#f87171',
+		'#34d399'
+	];
 	const pathFor = (rows) => rows.map((row, reel) => `${reel + 0.5},${row + 0.5}`).join(' ');
+	const tint = (i) => LINE_COLORS[i % LINE_COLORS.length];
 
 	const winningLineIdx = $derived(new Set(winLines.map((lw) => lw.line)));
-	const activeLines = $derived(PAYLINES.slice(0, lines));
 
 	/**
-	 * Edge markers grouped by the row a line enters (end 0) or leaves (end 2) on.
-	 * They have to be grouped: at five lines both the top row and the bottom row
-	 * are shared by a straight line and a diagonal, so one marker per row would
-	 * stack two badges on top of each other.
+	 * The active lines, as a strip of numbered chips under the window.
+	 *
+	 * The three-reel machine put these in rails down each side, grouped by the row
+	 * each line entered on. That does not survive nine lines: three lines enter on
+	 * every row, so a rail wide enough for three badges costs about a fifth of the
+	 * screen on a phone — and the window now needs five reels of it rather than
+	 * three. A horizontal strip costs no width at all, and it scales.
 	 */
-	function railFor(end) {
-		const rows = Array.from({ length: ROWS }, () => []);
-		activeLines.forEach((pl, i) => rows[pl.rows[end]].push(i));
-		return rows;
-	}
-	const leftRail = $derived(railFor(0));
-	const rightRail = $derived(railFor(2));
-	const tint = (i) => LINE_COLORS[i % LINE_COLORS.length];
+	const legend = $derived(
+		PAYLINES.slice(0, lines).map((pl, i) => ({ i, name: pl.name, won: winningLineIdx.has(i) }))
+	);
 </script>
 
 <div class="mm">
-	<!-- Left payline markers -->
-	<div class="mm-rail">
-		{#each leftRail as group, row}
-			<div class="mm-group" style="--row:{row}">
-				{#each group as i}
-					<span
-						class="mm-pip"
-						class:mm-pip-win={winningLineIdx.has(i)}
-						style="--tint:{tint(i)}"
-						title={PAYLINES[i].name}>{i + 1}</span
-					>
-				{/each}
-			</div>
-		{/each}
-	</div>
-
 	<div class="mm-window">
 		{#each view as reel, i}
 			<div class="mm-reel">
@@ -227,100 +230,50 @@
 		{/if}
 	</div>
 
-	<!-- Right payline markers -->
-	<div class="mm-rail">
-		{#each rightRail as group, row}
-			<div class="mm-group" style="--row:{row}">
-				{#each group as i}
-					<span
-						class="mm-pip"
-						class:mm-pip-win={winningLineIdx.has(i)}
-						style="--tint:{tint(i)}"
-						title={PAYLINES[i].name}>{i + 1}</span
-					>
-				{/each}
-			</div>
+	<div class="mm-legend">
+		{#each legend as l (l.i)}
+			<span class="mm-pip" class:mm-pip-win={l.won} style="--tint:{tint(l.i)}" title={l.name}>
+				{l.i + 1}
+			</span>
 		{/each}
 	</div>
 </div>
 
 <style>
 	.mm {
-		--cell: clamp(3rem, 19vw, 5rem);
+		/* Five reels have to fit a 320px phone with the page's own padding already
+		   taken out, so the ceiling is lower than the three-reel machine's and the
+		   viewport term does the work below it. */
+		--cell: clamp(2.4rem, 16.5vw, 3.6rem);
 		--pad: 3px;
 		display: flex;
-		align-items: stretch;
-		justify-content: center;
-		gap: 0.4rem;
+		flex-direction: column;
+		align-items: center;
+		gap: 0.5rem;
 		padding: 0.75rem 0.35rem;
 	}
 
 	/* On a desktop the window has a column to itself, so the cells grow into it
-	   rather than leaving the machine a phone-sized picture in a wide frame. */
+	   rather than leaving the machine a phone-sized picture in a wide frame. The
+	   steps are bounded by the narrowest layout that uses them: at xl the control
+	   rail takes 22rem out of the row, which leaves about 36rem for five reels. */
 	@media (min-width: 64rem) {
 		.mm {
-			--cell: 6.5rem;
+			--cell: 5rem;
 			--pad: 4px;
 			gap: 0.9rem;
-			padding: 1.5rem 1rem;
-		}
-		.mm-rail {
-			width: 2.8rem;
-		}
-		.mm-pip {
-			width: 1.35rem;
-			height: 1.35rem;
-			font-size: 0.72rem;
+			padding: 1.25rem 1rem;
 		}
 	}
 	@media (min-width: 80rem) {
 		.mm {
-			--cell: 7.5rem;
+			--cell: 5.5rem;
 		}
 	}
 	@media (min-width: 96rem) {
 		.mm {
-			--cell: 8.5rem;
+			--cell: 6.5rem;
 		}
-	}
-
-	/* Numbered payline markers down each side */
-	.mm-rail {
-		position: relative;
-		width: 2.4rem;
-		flex: none;
-	}
-	.mm-group {
-		position: absolute;
-		top: calc(var(--cell) * (var(--row) + 0.5));
-		left: 0;
-		right: 0;
-		translate: 0 -50%;
-		display: flex;
-		justify-content: center;
-		gap: 0.15rem;
-	}
-	.mm-pip {
-		display: grid;
-		place-items: center;
-		width: 1.1rem;
-		height: 1.1rem;
-		flex: none;
-		border-radius: 999px;
-		font-size: 0.65rem;
-		font-weight: 800;
-		font-variant-numeric: tabular-nums;
-		color: color-mix(in srgb, var(--tint) 70%, white);
-		background: color-mix(in srgb, var(--tint) 14%, transparent);
-		border: 1px solid color-mix(in srgb, var(--tint) 40%, transparent);
-		transition: all 0.18s ease;
-	}
-	.mm-pip-win {
-		color: #1c1917;
-		background: var(--tint);
-		border-color: white;
-		box-shadow: 0 0 0.6rem var(--tint);
-		scale: 1.15;
 	}
 
 	/* The window: a gapless ROWS x NREELS grid of cells */
@@ -411,6 +364,38 @@
 		pointer-events: none;
 	}
 
+	/* Numbered payline chips. Wraps, so nine of them cannot be the reason the page
+	   scrolls sideways on a narrow phone. */
+	.mm-legend {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: center;
+		gap: 0.25rem;
+		max-width: calc(var(--cell) * 5);
+	}
+	.mm-pip {
+		display: grid;
+		place-items: center;
+		width: 1.2rem;
+		height: 1.2rem;
+		flex: none;
+		border-radius: 999px;
+		font-size: 0.65rem;
+		font-weight: 800;
+		font-variant-numeric: tabular-nums;
+		color: color-mix(in srgb, var(--tint) 70%, white);
+		background: color-mix(in srgb, var(--tint) 14%, transparent);
+		border: 1px solid color-mix(in srgb, var(--tint) 40%, transparent);
+		transition: all 0.18s ease;
+	}
+	.mm-pip-win {
+		color: #1c1917;
+		background: var(--tint);
+		border-color: white;
+		box-shadow: 0 0 0.6rem var(--tint);
+		scale: 1.15;
+	}
+
 	@keyframes mm-pulse {
 		50% {
 			opacity: 0.45;
@@ -420,6 +405,13 @@
 	@media (prefers-reduced-motion: reduce) {
 		.mm-lit {
 			animation: none;
+		}
+	}
+	@media (min-width: 64rem) {
+		.mm-pip {
+			width: 1.45rem;
+			height: 1.45rem;
+			font-size: 0.75rem;
 		}
 	}
 </style>

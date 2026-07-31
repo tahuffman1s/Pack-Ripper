@@ -30,18 +30,44 @@
 	const capped = $derived(Math.floor(maxBuyPacks / perUnit));
 	const max = $derived(Math.max(0, Math.min(affordable, capped)));
 	const total = $derived(product.priceGold * qty);
-	const packs = $derived(perUnit * qty);
+
+	/**
+	 * Free units from a buy-one-get-one, mirrored from bonusUnits() on the server.
+	 * A hint, not the rule — the server recomputes it before anything is added, so a
+	 * sale that ends between this render and the button changes what arrives, not
+	 * what was charged.
+	 */
+	const freeUnits = $derived(
+		product.sale?.kind === 'bogo'
+			? Math.floor(qty / (product.sale.buyQty || 1)) * (product.sale.getQty || 1)
+			: 0
+	);
+	const packs = $derived(perUnit * (qty + freeUnits));
+	const discounted = $derived(product.fullPriceGold > product.priceGold);
 
 	function clamp(n) {
 		return Math.max(1, Math.min(Math.max(1, capped), Math.floor(Number(n) || 1)));
 	}
 </script>
 
-<div class="rounded-xl border border-white/10 bg-base-200/40 p-2.5 flex flex-col gap-2">
+<div
+	class="rounded-xl border bg-base-200/40 p-2.5 flex flex-col gap-2 {product.sale
+		? 'border-warning/40'
+		: 'border-white/10'}"
+>
 	<div class="text-center">
 		<div class="text-xs opacity-70">{label}</div>
-		<div class="font-bold leading-tight">🪙 {formatGold(product.priceGold)}</div>
-		<div class="text-[0.6rem] opacity-70">{product.live ? '' : '≈'}{formatUsd(product.priceUsd)} each</div>
+		<div class="font-bold leading-tight">
+			🪙 {formatGold(product.priceGold)}
+			{#if discounted}
+				<span class="text-[0.65rem] font-normal opacity-50 line-through">{formatGold(product.fullPriceGold)}</span>
+			{/if}
+		</div>
+		{#if product.sale}
+			<div class="badge badge-xs badge-warning font-bold mt-0.5">{product.sale.label}</div>
+		{:else}
+			<div class="text-[0.6rem] opacity-70">{product.live ? '' : '≈'}{formatUsd(product.priceUsd)} each</div>
+		{/if}
 	</div>
 
 	<div class="join w-full">
@@ -117,7 +143,11 @@
 		</button>
 	</form>
 
-	{#if qty > 1}
+	{#if freeUnits > 0}
+		<div class="text-[0.6rem] text-center font-bold text-warning -mt-1">
+			+{freeUnits} free · {packs.toLocaleString()} packs
+		</div>
+	{:else if qty > 1}
 		<div class="text-[0.6rem] text-center opacity-60 -mt-1">
 			{packs.toLocaleString()} pack{packs === 1 ? '' : 's'}
 		</div>

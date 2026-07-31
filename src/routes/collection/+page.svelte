@@ -2,7 +2,8 @@
 	import { invalidateAll } from '$app/navigation';
 	import { SvelteSet } from 'svelte/reactivity';
 	import CardTile from '$lib/components/CardTile.svelte';
-	import { rarityInfo, cardImage, marketGold, sellGold } from '$lib/cards.js';
+	import Card3D from '$lib/components/Card3D.svelte';
+	import { rarityInfo, marketGold, sellGold } from '$lib/cards.js';
 	import { formatGold } from '$lib/economy.js';
 
 	let { data } = $props();
@@ -236,40 +237,18 @@
 	</div>
 {/if}
 
-<!-- card detail modal -->
+<!-- Card detail. Tapping a tile hands the card to the 3D viewer, which is where the
+     picture, both faces and the sell button live. -->
 {#if detail}
-	{@const r = rarityInfo(detail.rarity)}
-	<div class="modal modal-open" role="dialog" tabindex="-1" onclick={(e) => { if (e.target === e.currentTarget) detail = null; }} onkeydown={(e)=> e.key==='Escape' && (detail=null)}>
-		<div class="modal-box max-w-sm lg:max-w-lg">
-			<div class="flex gap-4 lg:gap-6">
-				<div class="w-32 lg:w-44 shrink-0 aspect-[5/7] rounded-xl overflow-hidden {detail.foil ? 'foil-shimmer' : ''} {r.ring}">
-					{#if cardImage(detail)}
-						<img src={cardImage(detail, 'normal')} alt={detail.name} class="w-full h-full object-cover" />
-					{/if}
-				</div>
-				<div class="min-w-0 flex-1">
-					<h3 class="font-bold leading-tight">{detail.name}</h3>
-					<div class="mt-1 flex flex-wrap gap-1">
-						<span class="badge badge-sm {r.badge}">{r.label}</span>
-						{#if detail.foil}<span class="badge badge-sm bg-gradient-to-r from-cyan-400 to-fuchsia-400 text-black border-0">Foil</span>{/if}
-					</div>
-					<div class="text-xs text-base-content/50 mt-1">{detail.setName || detail.set?.toUpperCase()} · #{detail.number}</div>
-					<div class="mt-3 text-sm">Market: <span class="text-accent font-bold">🪙 {formatGold(marketGold(detail))}</span></div>
-					<div class="text-sm">Sells for: <span class="font-bold">🪙 {formatGold(sellGold(detail))}</span></div>
-					{#if detail.scryfallUri}
-						<a href={detail.scryfallUri} target="_blank" rel="noopener" class="link link-primary text-xs mt-1 inline-block">View on Scryfall ↗</a>
-					{/if}
-				</div>
-			</div>
-			<div class="modal-action mt-4">
-				<button class="btn btn-ghost btn-sm" onclick={() => (detail = null)}>Close</button>
-				<button class="btn btn-primary btn-sm" onclick={() => sell([detail.uid])} disabled={selling}>
-					Sell for 🪙 {formatGold(sellGold(detail))}
-				</button>
-			</div>
-		</div>
-	</div>
+	<Card3D card={detail} onclose={() => (detail = null)} actions={sellAction} />
 {/if}
+
+{#snippet sellAction(card)}
+	<button class="btn btn-primary btn-sm font-bold" onclick={() => sell([card.uid])} disabled={selling}>
+		{#if selling}<span class="loading loading-spinner loading-xs"></span>{/if}
+		Sell · 🪙{formatGold(sellGold(card))}
+	</button>
+{/snippet}
 
 {#if toast}
 	<div class="toast toast-top toast-center z-50 mt-16 px-4 w-full max-w-md">

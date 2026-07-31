@@ -4,6 +4,7 @@ import { productsForSet, buy, MAX_BUY_PACKS } from '$lib/server/game.js';
 import { fetchSetSealed } from '$lib/server/tcgplayer.js';
 import { getCollation } from '$lib/server/collation.js';
 import { packEvUsd } from '$lib/server/packvalue.js';
+import { loadSales } from '$lib/server/sales.js';
 
 /** @type {import('./$types').PageServerLoad} */
 export async function load({ params }) {
@@ -17,6 +18,9 @@ export async function load({ params }) {
 	// Price floor from the real sheets — see packvalue.js. Warmed here so the
 	// store shows a sane price for vintage product on first view.
 	await Promise.allSettled((set.packTypes || []).map((t) => packEvUsd(set.code, t)));
+	// Sale rules, so productsForSet() can quote the price the store is charging
+	// today rather than the market price.
+	await loadSales();
 
 	return {
 		set: {

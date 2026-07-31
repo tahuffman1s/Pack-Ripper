@@ -61,6 +61,16 @@ Gold
 Packs
   packs <user> <set> <product> [n]  grant n unopened packs, free
                                     product: draft set play jumpstart mystery collector
+  take-packs <user> [n]             remove n packs, oldest first (no refund)
+                 [--set X] [--product Y] [--all]
+
+Store
+  sales                             every sale rule, live or not
+  sale off <n> / sale delete <n>    switch one off / remove it (n from the list)
+  sales-end                         switch every sale off
+  sale <pct>% [--set X] [--product Y] [--days N] [--label "..."]
+  sale buy <n> get <m> [--set X] [--product Y] [--days N]
+  starting-gold [amount]            what a new account is handed
 
 Access
   admin <user>                      grant admin (the panel at /admin)
@@ -267,6 +277,126 @@ async function cmdPacks() {
 	);
 }
 
+async function cmdTakePacks() {
+	need(1, 'take-packs <user> [n] [--set X] [--product Y] [--all]');
+	const qty = args[1] ? Number(args[1]) : null;
+	if (!flags.all && !(qty >= 1)) {
+		die('say how many to remove, or pass --all.', `usage: take-packs ${args[0]} 5   |   take-packs ${args[0]} --all`);
+	}
+	const r = await api('take-packs', {
+		user: args[0],
+		setCode: flags.set || null,
+		packTypeId: flags.product || null,
+		...(flags.all ? { all: true } : { qty })
+	});
+	if (maybeJson(r)) return;
+	ok(`${r.user}: removed ${num(r.removed)} pack(s), no refund.`);
+}
+
+// ── store sales ────────────────────────────────────────────────
+
+const SALE_COLUMNS = [
+	{ label: '#', value: (s, i) => String(i + 1), right: true },
+	{ label: 'DEAL', value: (s) => (s.kind === 'percent' ? `${s.percent}% off` : `buy ${s.buyQty} get ${s.getQty}`) },
+	{
+		label: 'APPLIES TO',
+		value: (s) => [s.setCode?.toUpperCase(), s.packType].filter(Boolean).join(' ') || 'everything'
+	},
+	{ label: 'STATUS', value: (s) => (s.live ? 'live' : s.expired ? 'ended' : s.pending ? 'pending' : 'off') },
+	{ label: 'UNTIL', value: (s) => (s.endsAt ? when(s.endsAt) : '') },
+	{ label: 'LABEL', value: (s) => s.label || '' }
+];
+
+async function saleList() {
+	const { sales } = await api('sales');
+	return sales;
+}
+
+async function cmdSales() {
+	const sales = await saleList();
+	if (maybeJson({ sales })) return;
+	if (!sales.length) return info('  no sales — full price everywhere.');
+	// Numbered, because a sale id is a random string and nobody is typing one of
+	// those to switch a sale off.
+	table(sales.map((s, i) => ({ ...s, _i: i })), SALE_COLUMNS.map((col) =>
+		col.label === '#' ? { ...col, value: (s) => String(s._i + 1) } : col
+	));
+	info('  switch one off with: sale off <#>');
+}
+
+/** Resolve the `#` a listing showed back to a sale id. */
+async function saleIdAt(n) {
+	const sales = await saleList();
+	const i = Number(n) - 1;
+	if (!(i >= 0) || i >= sales.length) die(`there is no sale #${n}.`, 'run `sales` to see the list');
+	return sales[i].id;
+}
+
+async function cmdSale() {
+	const first = String(args[0] || '');
+
+	// `sale off 2`, `sale delete 2`, `sale on 2`
+	if (['off', 'delete', 'remove', 'on', 'resume'].includes(first.toLowerCase())) {
+		need(2, 'sale off <#>');
+		const id = await saleIdAt(args[1]);
+		const on = ['on', 'resume'].includes(first.toLowerCase());
+		const r = await api(on ? 'sale-on' : 'sale-off', {
+			id,
+			delete: ['delete', 'remove'].includes(first.toLowerCase())
+		});
+		if (maybeJson(r)) return;
+		ok(on ? 'sale resumed.' : 'sale switched off.');
+		return;
+	}
+
+	const scope = {
+		setCode: flags.set || null,
+		packType: flags.product || null,
+		label: typeof flags.label === 'string' ? flags.label : null,
+		endsAt: Number(flags.days) > 0 ? Date.now() + Number(flags.days) * 86_400_000 : null
+	};
+
+	// `sale buy 2 get 1`
+	if (first.toLowerCase() === 'buy') {
+		const buy = Number(args[1]);
+		const get = Number(args[3]);
+		if (!(buy >= 1) || !(get >= 1)) die('usage: sale buy <n> get <m>');
+		const r = await api('sale', { kind: 'bogo', buyQty: buy, getQty: get, ...scope });
+		if (maybeJson(r)) return;
+		ok(`${r.label} on ${r.scope}.`);
+		return;
+	}
+
+	// `sale 25%` or `sale 25`
+	const pct = Number(first.replace(/%$/, ''));
+	if (!(pct >= 1 && pct <= 99)) {
+		die(`"${first}" is not a percentage between 1 and 99.`, 'usage: sale 25% [--set X] [--product Y] [--days N]');
+	}
+	const r = await api('sale', { kind: 'percent', percent: pct, ...scope });
+	if (maybeJson(r)) return;
+	ok(`${r.label} on ${r.scope}.`);
+}
+
+async function cmdSalesEnd() {
+	const r = await api('sales-end');
+	if (maybeJson(r)) return;
+	ok(`${num(r.ended)} sale(s) switched off.`);
+}
+
+async function cmdStartingGold() {
+	if (!args.length) {
+		const { summary } = await api('overview');
+		if (maybeJson({ startingGold: summary.startingGold })) return;
+		info(`  new accounts start with ${num(summary.startingGold)} gold (stock: ${num(summary.defaultStartingGold)}).`);
+		return;
+	}
+	const amount = Number(args[0]);
+	if (!Number.isFinite(amount) || amount < 0) die(`"${args[0]}" is not a balance.`);
+	const r = await api('starting-gold', { amount });
+	if (maybeJson(r)) return;
+	ok(`new accounts now start with ${num(r.after)} gold (was ${num(r.before)}). Existing balances untouched.`);
+}
+
 async function cmdAdmin() {
 	need(1, 'admin <user> [off]');
 	const off = ['off', 'false', 'no', 'revoke'].includes(String(args[1] || '').toLowerCase());
@@ -440,6 +570,11 @@ const COMMANDS = {
 	show: cmdShow,
 	gold: cmdGold,
 	packs: cmdPacks,
+	'take-packs': cmdTakePacks,
+	sales: cmdSales,
+	sale: cmdSale,
+	'sales-end': cmdSalesEnd,
+	'starting-gold': cmdStartingGold,
 	admin: cmdAdmin,
 	passwd: cmdPasswd,
 	password: cmdPasswd,

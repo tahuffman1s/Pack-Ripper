@@ -7,9 +7,14 @@ import {
 	collectionValue,
 	fromPriceGold
 } from '$lib/server/game.js';
+import { loadSales } from '$lib/server/sales.js';
 
 /** @type {import('./$types').PageServerLoad} */
 export async function load({ locals }) {
+	// The "from" price on a hot-set tile is a sale price when a sale is on, and
+	// fromPriceGold reads the rules synchronously, so they have to be loaded first.
+	await loadSales();
+
 	const featured = featuredSets()
 		.map((s) => ({
 			code: s.code,

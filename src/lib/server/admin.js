@@ -28,9 +28,30 @@ import {
 } from './auth.js';
 import { setEntry, storeSets } from './registry.js';
 import { packTypeById } from '../packs.js';
-import { STARTING_GOLD } from '../economy.js';
 import { versionInfo } from './version.js';
-import { addPacks, getStats, getOpenings, packPriceGold, MAX_BUY_PACKS } from './game.js';
+import {
+	addPacks,
+	removePacks,
+	getStats,
+	getOpenings,
+	packPriceGold,
+	inventorySummary,
+	MAX_BUY_PACKS
+} from './game.js';
+import {
+	startingGold,
+	setStartingGold,
+	DEFAULT_STARTING_GOLD,
+	MAX_STARTING_GOLD
+} from './settings.js';
+import {
+	listSales,
+	createSale,
+	setSaleEnabled,
+	deleteSale,
+	endAllSales,
+	saleLabel
+} from './sales.js';
 
 /**
  * Shared secret for the CLI, from the container's environment. Unset means
@@ -176,6 +197,11 @@ export async function summary() {
 		users: r.users,
 		admins: r.admins,
 		envAdmins: envAdminNames(),
+		// What the next registration is handed, and what the compiled default was,
+		// so the panel can offer "back to stock" without knowing the number.
+		startingGold: await startingGold(),
+		defaultStartingGold: DEFAULT_STARTING_GOLD,
+		maxStartingGold: MAX_STARTING_GOLD,
 		sessions: r.sessions,
 		gold: r.gold,
 		cards: r.cards,
@@ -323,6 +349,42 @@ function actionPacks(actor, args) {
 	});
 }
 
+/**
+ * Take unopened packs back out of a vault.
+ *
+ * The mirror of a grant, and refunds nothing — this is for undoing a mistake or
+ * cleaning up, not for transacting on someone's behalf. With no set and no
+ * product it empties the vault, which is why `all` has to be sent explicitly:
+ * "remove packs" with an omitted quantity must not silently mean "all of them".
+ */
+function actionTakePacks(actor, args) {
+	return withUser(args, async (user) => {
+		const setCode = args.setCode ? String(args.setCode).toLowerCase() : null;
+		const packTypeId = args.packTypeId ? String(args.packTypeId) : null;
+		if (packTypeId && !packTypeById(packTypeId)) {
+			return { ok: false, error: `Unknown pack type "${packTypeId}".` };
+		}
+
+		const all = !!args.all;
+		let qty = null;
+		if (!all) {
+			qty = Math.floor(Number(args.qty));
+			if (!(qty >= 1)) {
+				return { ok: false, error: 'Say how many to remove, or pass all to empty the vault.' };
+			}
+		}
+
+		const result = await tx((client) =>
+			removePacks(client, user.id, { setCode, packTypeId, qty })
+		);
+		if (!result.removed) return { ok: false, error: 'No matching packs to remove.' };
+
+		const scope = [setCode?.toUpperCase(), packTypeId].filter(Boolean).join(' ') || 'every product';
+		await record(actor, 'packs.remove', user.username, `${result.removed}× ${scope}`);
+		return { ok: true, user: user.username, removed: result.removed, byProduct: result.byProduct };
+	});
+}
+
 /** Grant or revoke admin. */
 function actionAdmin(actor, args) {
 	return withUser(args, async (user) => {
@@ -459,17 +521,109 @@ async function actionUsers() {
 
 function actionUser(actor, args) {
 	return withUser(args, async (user) => {
-		const [row, stats, openings] = await Promise.all([
+		const [row, stats, openings, vault] = await Promise.all([
 			userRow(user.id),
 			getStats(user.id),
-			getOpenings(user.id)
+			getOpenings(user.id),
+			// The vault, grouped by product — what the panel's remove control needs in
+			// order to offer choices that exist rather than a free-text set code.
+			inventorySummary(user.id)
 		]);
-		return { ok: true, user: { ...row, stats, openings: openings.slice(0, 5) } };
+		return { ok: true, user: { ...row, stats, openings: openings.slice(0, 5), vault } };
 	});
 }
 
 async function actionLog(actor, args) {
 	return { ok: true, log: await auditLog(args.limit ?? 50) };
+}
+
+// ── Store sales ────────────────────────────────────────────────
+
+async function actionSales() {
+	return { ok: true, sales: await listSales() };
+}
+
+/**
+ * Put a sale on.
+ *
+ * Scope is validated against the real catalogue rather than stored as typed: a
+ * sale on a set that does not exist, or on a product that set never shipped, is a
+ * rule that can never fire and would sit in the panel looking as though it had.
+ */
+function actionSale(actor, args) {
+	return (async () => {
+		const setCode = args.setCode ? String(args.setCode).toLowerCase() : null;
+		const packType = args.packType ? String(args.packType) : null;
+
+		if (setCode) {
+			const set = setEntry(setCode);
+			if (!set) return { ok: false, error: `Unknown set "${args.setCode}".` };
+			if (packType && !(set.packTypes || []).includes(packType)) {
+				return {
+					ok: false,
+					error: `${set.code.toUpperCase()} has no ${packType} booster, so that sale could never apply.`
+				};
+			}
+		}
+		if (packType && !packTypeById(packType)) {
+			return { ok: false, error: `Unknown pack type "${packType}".` };
+		}
+
+		let sale;
+		try {
+			sale = await createSale({ ...args, setCode, packType, createdBy: actor.name });
+		} catch (e) {
+			return { ok: false, error: e.message || 'Could not create that sale.' };
+		}
+
+		const scope = [setCode?.toUpperCase(), packType].filter(Boolean).join(' ') || 'everything';
+		await record(actor, 'sale.create', scope, saleLabel(sale));
+		return { ok: true, sale, scope, label: saleLabel(sale) };
+	})();
+}
+
+async function actionSaleOff(actor, args) {
+	const id = String(args.id || '');
+	if (!id) return { ok: false, error: 'Which sale?' };
+	const ok = args.delete ? await deleteSale(id) : await setSaleEnabled(id, false);
+	if (!ok) return { ok: false, error: 'No such sale.' };
+	await record(actor, args.delete ? 'sale.delete' : 'sale.end', null, id);
+	return { ok: true, id };
+}
+
+async function actionSaleOn(actor, args) {
+	const id = String(args.id || '');
+	if (!id) return { ok: false, error: 'Which sale?' };
+	if (!(await setSaleEnabled(id, true))) return { ok: false, error: 'No such sale.' };
+	await record(actor, 'sale.resume', null, id);
+	return { ok: true, id };
+}
+
+async function actionSalesEnd(actor) {
+	const n = await endAllSales();
+	await record(actor, 'sale.end', null, `${n} sale(s) switched off`);
+	return { ok: true, ended: n };
+}
+
+// ── Starting gold ──────────────────────────────────────────────
+
+/**
+ * Change what a new account is handed.
+ *
+ * Existing wallets are deliberately untouched: this is the grant the NEXT
+ * registration receives, and the balance every wallet returns to on a database
+ * reset. Raising it to catch existing players up is what the gold action is for.
+ */
+async function actionStartingGold(actor, args) {
+	const before = await startingGold();
+	let after;
+	try {
+		after = await setStartingGold(args.amount);
+	} catch (e) {
+		return { ok: false, error: e.message || 'Could not set the starting gold.' };
+	}
+	await record(actor, 'settings.startingGold', null, `${before} → ${after}`);
+	return { ok: true, before, after, applied: 'new accounts and database resets' };
 }
 
 /** The word a caller has to send to prove a database reset is deliberate. */
@@ -506,15 +660,18 @@ async function actionResetDatabase(actor, args) {
 
 	// The figures for the audit entry, read before they stop existing.
 	const before = await summary();
+	// Whatever the starting grant is set to NOW, not the compiled default — an
+	// admin who raised it wants the reset to hand out the raised figure.
+	const grant = await startingGold();
 
 	await tx(async (client) => {
 		await client.query(
-			'TRUNCATE collections, inventory, openings, stats, blackjack, free_spins, serials'
+			'TRUNCATE collections, inventory, openings, stats, blackjack, free_spins, serials, announcements'
 		);
 		// Not TRUNCATE: the row per account has to stay, at the balance a new
 		// account starts with. A player with no wallet row reads as zero gold and
 		// could not buy their first pack.
-		await client.query('UPDATE wallets SET gold = $1', [STARTING_GOLD]);
+		await client.query('UPDATE wallets SET gold = $1', [grant]);
 	});
 
 	await record(
@@ -522,7 +679,7 @@ async function actionResetDatabase(actor, args) {
 		'db.reset',
 		null,
 		`wiped ${before.cards} cards, ${before.packs} packs, ${before.serialsIssued} serials across ` +
-			`${before.users} account(s); wallets set to ${STARTING_GOLD}`
+			`${before.users} account(s); wallets set to ${grant}`
 	);
 
 	return {
@@ -531,7 +688,7 @@ async function actionResetDatabase(actor, args) {
 		cardsWiped: before.cards,
 		packsWiped: before.packs,
 		serialsReleased: before.serialsIssued,
-		goldEach: STARTING_GOLD
+		goldEach: grant
 	};
 }
 
@@ -546,6 +703,13 @@ const HANDLERS = {
 	log: actionLog,
 	gold: actionGold,
 	packs: actionPacks,
+	'take-packs': actionTakePacks,
+	sales: actionSales,
+	sale: actionSale,
+	'sale-off': actionSaleOff,
+	'sale-on': actionSaleOn,
+	'sales-end': actionSalesEnd,
+	'starting-gold': actionStartingGold,
 	admin: actionAdmin,
 	password: actionPassword,
 	logout: actionLogout,

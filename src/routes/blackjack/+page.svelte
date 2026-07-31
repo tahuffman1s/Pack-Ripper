@@ -25,6 +25,16 @@
 
 	let session = $state({ rounds: 0, net: 0 });
 
+	/**
+	 * A stake as a chip label. The ladder runs to a million, and eight buttons of
+	 * "1,000,000" do not fit across a phone — 1M does.
+	 */
+	function short(n) {
+		if (n >= 1_000_000) return `${n / 1_000_000}M`;
+		if (n >= 1_000) return `${n / 1_000}k`;
+		return String(n);
+	}
+
 	const affordable = $derived(maxAffordableBet(gold));
 	const inPlay = $derived(table?.phase === 'player');
 	const canDeal = $derived(!busy && !inPlay && affordable !== null && gold >= bet);
@@ -257,12 +267,14 @@
 						aria-label="Raise bet">+</button
 					>
 				</div>
-				<div class="grid grid-cols-6 gap-1">
+				<!-- Four across, not six: the ladder now runs to a million and
+				     "1,000,000" does not fit a sixth of a phone's width. -->
+				<div class="grid grid-cols-4 gap-1">
 					{#each BET_LEVELS as level}
 						<button
 							class="btn btn-xs {bet === level ? 'btn-primary' : 'btn-ghost'} font-bold tabular-nums"
 							onclick={() => (bet = level)}
-							disabled={busy || level > gold}>{level}</button
+							disabled={busy || level > gold}>{short(level)}</button
 						>
 					{/each}
 				</div>

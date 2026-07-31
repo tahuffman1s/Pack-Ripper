@@ -1,7 +1,11 @@
 <script>
+	import Card3D from './Card3D.svelte';
 	import { rarityInfo, cardImage, marketGold, topTreatment, treatmentInfo, finishLabel } from '$lib/cards.js';
 	import { formatGold } from '$lib/economy.js';
 	import { PACK_TYPES } from '$lib/packs.js';
+
+	/** The card being examined in the 3D viewer, or null. */
+	let inspect = $state(null);
 
 	let { group, onclose = () => {}, onopened = () => {} } = $props();
 
@@ -252,7 +256,14 @@
 					<div>
 						<!-- badges are absolute to the image box, not the tile, so they
 						     never sit on top of the price line below it -->
-						<div class="relative aspect-[5/7] rounded-md overflow-hidden {card.foil ? 'foil-shimmer' : ''} {r.ring}">
+						<button
+							type="button"
+							class="relative block w-full aspect-[5/7] rounded-md overflow-hidden transition-transform active:scale-95 {card.foil
+								? 'foil-shimmer'
+								: ''} {r.ring}"
+							onclick={() => (inspect = card)}
+							aria-label="Look at {card.name}"
+						>
 							{#if cardImage(card)}
 								<img src={cardImage(card, 'normal')} alt={card.name} loading="lazy" class="w-full h-full object-cover" />
 							{:else}
@@ -271,7 +282,7 @@
 									{finishLabel(card)}
 								</span>
 							{/if}
-						</div>
+						</button>
 						<div class="text-[0.6rem] text-accent font-bold text-center mt-0.5 tabular-nums">
 							🪙{formatGold(marketGold(card))}
 						</div>
@@ -304,3 +315,8 @@
 		</div>
 	{/if}
 </div>
+
+<!-- Any of the rip's top pulls, big and in the hand. -->
+{#if inspect}
+	<Card3D card={inspect} onclose={() => (inspect = null)} />
+{/if}

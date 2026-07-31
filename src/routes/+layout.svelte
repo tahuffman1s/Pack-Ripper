@@ -40,8 +40,59 @@
 		{ href: '/collection', label: 'Cards', icon: 'cards' },
 		{ href: '/slots', label: 'Slots', icon: 'slots' },
 		{ href: '/blackjack', label: '21', icon: 'cardgame' },
+		{ href: '/leaderboard', label: 'Top', icon: 'trophy' },
 		{ href: '/stats', label: 'Stats', icon: 'stats' }
 	];
+
+	// ── System announcements ───────────────────────────────────
+	// The board is polled rather than pushed. A websocket for a message every few
+	// minutes would be a connection per player held open all day for nothing, and
+	// the poll is one indexed lookup that normally returns an empty list.
+	const POLL_MS = 30_000;
+	/** How long a toast stays up. Long enough to read a card name and a price. */
+	const TOAST_MS = 12_000;
+
+	let news = $state([]);
+	// Starts at "now", so opening a page does not replay everything that happened
+	// while you were away — /leaderboard is where the history lives.
+	let newsSince = Date.now();
+
+	function dismiss(id) {
+		news = news.filter((n) => n.id !== id);
+	}
+
+	$effect(() => {
+		if (!data.user) return;
+
+		let stopped = false;
+		const poll = async () => {
+			// A hidden tab is a tab nobody is reading. Skipping the request keeps a
+			// forgotten tab from talking to the server all day.
+			if (stopped || document.visibilityState !== 'visible') return;
+			try {
+				const res = await fetch(`/api/announcements?since=${newsSince}`);
+				if (!res.ok) return;
+				const body = await res.json();
+				if (stopped || !body.items?.length) return;
+				newsSince = Math.max(newsSince, ...body.items.map((i) => i.at));
+				// Oldest first, so a burst reads in the order it happened, and capped so
+				// a mass rip that pulled six grails does not paper over the screen.
+				const fresh = [...body.items].reverse().slice(-3);
+				news = [...news, ...fresh].slice(-3);
+				for (const n of fresh) setTimeout(() => dismiss(n.id), TOAST_MS);
+			} catch {
+				// Offline, or the server is restarting. The next tick tries again.
+			}
+		};
+
+		const timer = setInterval(poll, POLL_MS);
+		document.addEventListener('visibilitychange', poll);
+		return () => {
+			stopped = true;
+			clearInterval(timer);
+			document.removeEventListener('visibilitychange', poll);
+		};
+	});
 
 	// The admin panel is only linked for admins, and /admin is a 404 for everyone
 	// else — a URL nobody is told about is one nobody probes.
@@ -70,6 +121,8 @@
 		<svg class="size-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 6v12M15 6v12" stroke-linecap="round"/></svg>
 	{:else if icon === 'cardgame'}
 		<svg class="size-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="7" y="4" width="11" height="15" rx="2"/><path d="M4.5 7.5v11a2 2 0 0 0 2 2h8" stroke-linecap="round"/></svg>
+	{:else if icon === 'trophy'}
+		<svg class="size-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 4h8v5a4 4 0 0 1-8 0V4ZM8 5H5v2a3 3 0 0 0 3 3M16 5h3v2a3 3 0 0 1-3 3M10 17h4M12 13v4M8 21h8" stroke-linecap="round" stroke-linejoin="round"/></svg>
 	{:else if icon === 'admin'}
 		<svg class="size-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="14" r="4"/><path d="M11 11l8-8M16.5 5.5 19 8M14 3.5 16.5 6" stroke-linecap="round" stroke-linejoin="round"/></svg>
 	{:else}
@@ -221,6 +274,52 @@
 
 				{@render children()}
 			</main>
+
+			<!-- ── the noticeboard ───────────────────────────────────
+			     Server-wide news: a serialized pull, a card worth 🪙50,000, a Booster
+			     Vault on the slots. Fixed to the viewport rather than the page, and
+			     clear of both the mobile bottom bar and the desktop rail. -->
+			{#if news.length}
+				<div
+					class="fixed z-50 inset-x-0 bottom-20 px-3 lg:bottom-4 lg:left-auto lg:right-4 lg:w-96 lg:px-0 flex flex-col gap-2 pointer-events-none"
+					aria-live="polite"
+				>
+					{#each news as n (n.id)}
+						<a
+							href="/leaderboard"
+							class="pointer-events-auto flex items-start gap-2.5 rounded-2xl border border-fuchsia-400/40 bg-base-300/95 backdrop-blur-md shadow-2xl p-2.5 mx-auto w-full max-w-md lg:max-w-none"
+						>
+							{#if n.image}
+								<img src={n.image} alt="" class="w-9 h-[3.15rem] shrink-0 rounded object-cover border border-white/10" />
+							{:else}
+								<span class="w-9 shrink-0 grid place-items-center text-2xl leading-none">
+									{n.kind === 'slot' ? '🎰' : n.kind === 'serial' ? '🔢' : '🃏'}
+								</span>
+							{/if}
+							<div class="min-w-0 flex-1">
+								<div class="text-[0.6rem] uppercase tracking-widest text-fuchsia-300 font-bold">
+									{n.kind === 'serial' ? 'Serialized pull' : n.kind === 'slot' ? 'Mana Machine' : 'Big pull'}
+								</div>
+								<div class="text-sm font-semibold leading-snug">{n.headline}</div>
+								{#if n.detail}
+									<div class="text-[0.68rem] text-base-content/50 truncate">{n.detail}</div>
+								{/if}
+							</div>
+							{#if n.gold}
+								<span class="shrink-0 text-sm font-black text-accent tabular-nums">🪙{formatGold(n.gold)}</span>
+							{/if}
+							<button
+								class="shrink-0 btn btn-ghost btn-xs btn-circle"
+								onclick={(e) => {
+									e.preventDefault();
+									dismiss(n.id);
+								}}
+								aria-label="Dismiss">✕</button
+							>
+						</a>
+					{/each}
+				</div>
+			{/if}
 
 			<!-- Bottom nav -->
 			<nav

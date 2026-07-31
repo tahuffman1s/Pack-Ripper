@@ -8,6 +8,15 @@
  * (from their real-world MSRP) and to value cards (from Scryfall USD prices).
  */
 
+/**
+ * The DEFAULT opening balance.
+ *
+ * The live figure is a row in the `settings` table that an admin can change
+ * without a redeploy, and this is what a database with no such row returns — so a
+ * fresh install behaves exactly as it did before that table existed. Read it
+ * through `startingGold()` in server/settings.js on any path that actually hands
+ * gold out; this constant is only the fallback and the "back to stock" value.
+ */
 export const STARTING_GOLD = 100_000;
 
 /** 100 gold per US dollar. */

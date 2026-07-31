@@ -20,6 +20,11 @@ const NO_TREATMENTS = Object.freeze([]);
 function forDisplay(c, images) {
 	return {
 		uid: c.uid,
+		// The Scryfall id. Carried purely so the 3D viewer can ask
+		// /api/card-faces/<id> whether this printing has a real second face — it is
+		// one short string per card and it is the only way a stored instance can be
+		// turned back into a two-sided card.
+		id: c.id ?? null,
 		name: c.name,
 		set: c.set,
 		setName: c.setName,

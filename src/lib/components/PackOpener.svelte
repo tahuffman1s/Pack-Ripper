@@ -1,6 +1,7 @@
 <script>
 	import { tick, onMount } from 'svelte';
 	import Pack3D from './Pack3D.svelte';
+	import Card3D from './Card3D.svelte';
 	import {
 		rarityInfo,
 		cardImage,
@@ -12,6 +13,9 @@
 	} from '$lib/cards.js';
 	import { formatGold } from '$lib/economy.js';
 	import { PACK_TYPES } from '$lib/packs.js';
+
+	/** The card being examined in the 3D viewer, or null. */
+	let inspect = $state(null);
 
 	let { group, onclose = () => {}, onopened = () => {} } = $props();
 
@@ -316,13 +320,20 @@
 			<div class="grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-8 xl:grid-cols-10 gap-1.5 lg:gap-2">
 				{#each [...cards].sort((a, b) => marketGold(b) - marketGold(a)) as card (card.uid)}
 					{@const r = rarityInfo(card.rarity)}
-					<div class="aspect-[5/7] rounded-md overflow-hidden {card.foil ? 'foil-shimmer' : ''} {r.ring}">
+					<button
+						type="button"
+						class="block w-full aspect-[5/7] rounded-md overflow-hidden transition-transform active:scale-95 {card.foil
+							? 'foil-shimmer'
+							: ''} {r.ring}"
+						onclick={() => (inspect = card)}
+						aria-label="Look at {card.name}"
+					>
 						{#if cardImage(card)}
 							<img src={cardImage(card, 'normal')} alt={card.name} loading="lazy" class="w-full h-full object-cover" />
 						{:else}
 							<div class="w-full h-full grid place-items-center bg-base-100 text-[0.5rem] p-1 text-center {r.text}">{card.name}</div>
 						{/if}
-					</div>
+					</button>
 				{/each}
 			</div>
 		</div>
@@ -335,3 +346,9 @@
 		</div>
 	{/if}
 </div>
+
+<!-- Any card from the rip, big and in the hand. Rendered outside the opener's own
+     stacking context so it sits over the whole screen. -->
+{#if inspect}
+	<Card3D card={inspect} onclose={() => (inspect = null)} />
+{/if}

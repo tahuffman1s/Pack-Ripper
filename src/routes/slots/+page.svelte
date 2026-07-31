@@ -9,9 +9,13 @@
 		DEFAULT_BET,
 		DEFAULT_LINES,
 		PAYLINES,
+		PAYS,
 		PAYTABLE,
-		SCATTER,
+		SCATTER_NEED,
+		SCATTER_TIERS,
+		PACK_TIERS,
 		SYMBOLS,
+		NREELS,
 		maxAffordableBet,
 		stepBet,
 		totalBet
@@ -33,7 +37,7 @@
 	/** The stake the server locked in for the bonus round, authoritative while it runs. */
 	let lockedStake = $state(data.freeSpins ? { lineBet: data.freeSpins.lineBet, lines: data.freeSpins.lines } : null);
 
-	let session = $state({ spins: 0, staked: 0, won: 0, bonuses: 0 });
+	let session = $state({ spins: 0, staked: 0, won: 0, bonuses: 0, packs: 0 });
 
 	const stake = $derived(totalBet(bet, lines));
 	const affordable = $derived(maxAffordableBet(gold, lines));
@@ -109,12 +113,13 @@
 		session.staked += held.cost;
 		session.won += held.win;
 		if (held.awardedFreeSpins) session.bonuses += 1;
+		if (held.prize) session.packs += 1;
 		held = null;
 		spinning = false;
 		invalidateAll();
 	}
 
-	/** Cells that are part of a winning line, for the result grid. */
+	/** Cells that are part of a winning line, for the reels' own readout. */
 	const litCells = $derived.by(() => {
 		const lit = new Set();
 		for (const lw of result?.lineWins ?? []) {
@@ -126,15 +131,23 @@
 		return lit;
 	});
 
-	const payRows = [
-		{ key: 'wild3', icons: ['wild', 'wild', 'wild'] },
-		{ key: 'mythic3', icons: ['mythic', 'mythic', 'mythic'] },
-		{ key: 'foil3', icons: ['foil', 'foil', 'foil'] },
-		{ key: 'mana3', icons: ['r', 'r', 'r'] },
-		{ key: 'rainbow3', icons: ['w', 'u', 'g'] },
-		{ key: 'mythic2', icons: ['mythic', 'mythic'] },
-		{ key: 'foil2', icons: ['foil', 'foil'] }
+	/**
+	 * The paytable, as one row per symbol with a column per run length. Built from
+	 * PAYS rather than listed by hand so a retune cannot leave the screen lying.
+	 */
+	const PAY_ROWS = [
+		{ cls: 'wild', icon: 'wild' },
+		{ cls: 'mythic', icon: 'mythic' },
+		{ cls: 'foil', icon: 'foil' },
+		{ cls: 'mana', icon: 'r' }
 	];
+	const RUNS = [5, 4, 3, 2];
+
+	const scatterRows = $derived(
+		Object.entries(SCATTER_TIERS)
+			.map(([count, t]) => ({ count: Number(count), ...t }))
+			.sort((a, b) => b.count - a.count)
+	);
 </script>
 
 <svelte:head><title>Mana Machine · PackRipper</title></svelte:head>
@@ -149,7 +162,7 @@
 		<div>
 			<h1 class="text-2xl lg:text-3xl font-black tracking-tight">Mana Machine</h1>
 			<p class="text-sm text-base-content/50">
-				3 reels × 3 rows, {PAYLINES.length} paylines, free spins.
+				{NREELS} reels × 3 rows, {PAYLINES.length} paylines. Pays gold, free spins and booster packs.
 			</p>
 		</div>
 
@@ -166,11 +179,10 @@
 			</div>
 		{/if}
 
-		<!-- The machine. The reels ARE the result readout now: winning cells light up
-		     in place and the paylines are traced across them, so there is no separate
-		     grid to keep in sync. -->
-		<!-- The cabinet hugs the reels on desktop and centres, rather than stretching a
-		     phone-width picture across the whole column. -->
+		<!-- The machine. The reels ARE the result readout: winning cells light up in
+		     place and the paylines are traced across them, so there is no separate
+		     grid to keep in sync. The cabinet hugs the reels on desktop and centres,
+		     rather than stretching a phone-width picture across the whole column. -->
 		<div class="rounded-2xl overflow-hidden bg-gradient-to-b from-base-100 to-base-300 border border-white/10 shadow-2xl lg:w-fit lg:mx-auto">
 			<SlotMachine2D
 				bind:this={machine}
@@ -182,17 +194,25 @@
 
 			{#if result}
 				<div class="px-3 pb-3">
-					{#if result.win > 0}
+					{#if result.win > 0 || result.prize}
 						<div
 							class="rounded-xl px-4 py-2.5 text-center font-black shadow-xl bg-gradient-to-r from-amber-300 via-fuchsia-400 to-cyan-300 text-black"
-							class:animate-bounce={result.win >= result.stake * 20}
+							class:animate-bounce={result.win >= result.stake * 20 || result.packTier === 'vault'}
 						>
 							<div class="text-[0.65rem] uppercase tracking-widest opacity-80">
-								{result.scatterHit ? SCATTER.label : result.lineWins[0]?.label}
+								{result.scatterHit ? result.scatterLabel : result.lineWins[0]?.label}
 								{#if result.lineWins.length > 1}· {result.lineWins.length} lines{/if}
 							</div>
-							<div class="text-2xl">+🪙 {formatGold(result.win)}</div>
-							{#if result.cost > 0 && result.win < result.cost}
+							{#if result.win > 0}
+								<div class="text-2xl">+🪙 {formatGold(result.win)}</div>
+							{/if}
+							{#if result.prize}
+								<div class="text-sm leading-tight mt-0.5">
+									+ {result.prize.setName} {result.prize.packName}
+									<span class="opacity-70">(🪙{formatGold(result.prize.priceGold)})</span>
+								</div>
+							{/if}
+							{#if result.cost > 0 && result.win + (result.prize?.priceGold ?? 0) < result.cost}
 								<div class="text-[0.65rem] opacity-70">less than the 🪙{formatGold(result.cost)} staked</div>
 							{/if}
 						</div>
@@ -204,6 +224,30 @@
 				</div>
 			{/if}
 		</div>
+
+		<!-- Where the pack prize went, when one landed. -->
+		{#if result?.prize}
+			<a
+				href="/packs"
+				class="block rounded-2xl border border-primary/40 bg-primary/10 p-3 hover:border-primary/70 transition-colors"
+			>
+				<div class="flex items-center gap-3">
+					<span class="text-3xl leading-none">📦</span>
+					<div class="min-w-0 flex-1">
+						<div class="text-[0.65rem] uppercase tracking-widest text-primary font-bold">
+							{result.prize.tierLabel}
+						</div>
+						<div class="font-bold truncate">{result.prize.setName} · {result.prize.packName}</div>
+						<div class="text-xs text-base-content/60">
+							Worth 🪙{formatGold(result.prize.priceGold)}{result.prize.changeGold
+								? ` — plus 🪙${formatGold(result.prize.changeGold)} change`
+								: ''}. It is in your vault.
+						</div>
+					</div>
+					<span class="text-base-content/30">›</span>
+				</div>
+			</a>
+		{/if}
 
 		<!-- What paid, line by line -->
 		{#if result && (result.lineWins.length || result.scatterHit)}
@@ -284,14 +328,14 @@
 				>
 			</div>
 
-			<div class="grid grid-cols-6 gap-1">
+			<div class="grid grid-cols-4 gap-1">
 				{#each BET_LEVELS as level}
 					<button
 						class="btn btn-xs {bet === level ? 'btn-primary' : 'btn-ghost'} font-bold tabular-nums"
 						onclick={() => setBet(level)}
 						disabled={spinning || freeLeft > 0 || level * lines > gold}
 					>
-						{level}
+						{formatGold(level)}
 					</button>
 				{/each}
 			</div>
@@ -333,8 +377,8 @@
 					<div class="text-[0.65rem] text-base-content/45">Won</div>
 				</div>
 				<div class="rounded-xl bg-base-100/50 p-2.5">
-					<div class="text-lg font-black tabular-nums text-fuchsia-300">{session.bonuses}</div>
-					<div class="text-[0.65rem] text-base-content/45">Bonuses</div>
+					<div class="text-lg font-black tabular-nums text-primary">{session.packs}</div>
+					<div class="text-[0.65rem] text-base-content/45">Packs</div>
 				</div>
 				<div class="rounded-xl bg-base-100/50 p-2.5">
 					<div class="text-lg font-black tabular-nums {sessionNet >= 0 ? 'text-success' : 'text-error'}">
@@ -345,59 +389,95 @@
 			</div>
 		{/if}
 
-		<!-- Paytable -->
+		<!-- ── Booster prizes ─────────────────────────────────────── -->
+		<div class="rounded-2xl bg-base-100/50 border border-fuchsia-400/25 p-4">
+			<div class="flex items-baseline justify-between mb-2">
+				<span class="text-xs uppercase tracking-widest text-fuchsia-300">Booster prizes</span>
+				<span class="text-[0.7rem] text-base-content/40">Boosters anywhere</span>
+			</div>
+			<div class="space-y-2">
+				{#each scatterRows as row}
+					<div class="flex items-center gap-2.5">
+						<div class="flex gap-0.5 w-16 shrink-0">
+							{#each Array(row.count) as _}
+								<span
+									class="size-4 rounded grid place-items-center text-[0.55rem] border border-black/20"
+									style="background:{SYMBOLS.scatter.color};color:{SYMBOLS.scatter.text}"
+									>{SYMBOLS.scatter.glyph}</span
+								>
+							{/each}
+						</div>
+						<div class="min-w-0 flex-1">
+							<div class="text-sm font-bold truncate">{PACK_TIERS[row.tier].label}</div>
+							<div class="text-[0.65rem] text-base-content/50">
+								🪙{formatGold(row.payMult * stake)} + a pack near 🪙{formatGold(row.packMult * stake)} + {row.freeSpins} free spins
+							</div>
+						</div>
+					</div>
+				{/each}
+			</div>
+			<p class="text-[0.7rem] text-base-content/40 mt-3 leading-relaxed">
+				A pack prize is a budget, not a named product — {SCATTER_NEED} Boosters is worth about your
+				stake, five is worth 150 times it — and the shop hands over something real that costs about
+				that much, with the difference paid as change. So a bigger stake wins better packs, and a
+				budget too small for anything on the shelf simply arrives as gold. Free spins never award more
+				free spins, but they can still win a pack.
+			</p>
+		</div>
+
+		<!-- ── Paytable ──────────────────────────────────────────── -->
 		<div class="rounded-2xl bg-base-100/50 border border-white/5 p-4">
 			<div class="flex items-baseline justify-between mb-3">
 				<span class="text-xs uppercase tracking-widest text-base-content/40">Paytable</span>
 				<span class="text-[0.7rem] text-base-content/40">per line, at 🪙{formatGold(bet)}</span>
 			</div>
-			<div class="space-y-1.5">
-				{#each payRows as row}
-					{@const def = PAYTABLE[row.key]}
-					<div class="flex items-center gap-3">
-						<div class="flex gap-1 w-24 shrink-0">
-							{#each row.icons as id}
-								{@const s = SYMBOLS[id]}
-								<span
-									class="size-6 rounded-md grid place-items-center text-xs border border-black/20"
-									style="background:{s.color};color:{s.text}">{s.glyph}</span
-								>
-							{/each}
-						</div>
-						<div class="flex-1 text-sm text-base-content/70 truncate">{def.label}</div>
-						<div class="font-bold tabular-nums text-accent whitespace-nowrap">
-							🪙{formatGold(def.mult * bet)}
-						</div>
-					</div>
-				{/each}
 
-				<div class="flex items-center gap-3 pt-1.5 mt-1.5 border-t border-white/5">
-					<div class="flex gap-1 w-24 shrink-0">
-						{#each Array(SCATTER.need) as _}
-							<span
-								class="size-6 rounded-md grid place-items-center text-xs border border-black/20"
-								style="background:{SYMBOLS.scatter.color};color:{SYMBOLS.scatter.text}"
-								>{SYMBOLS.scatter.glyph}</span
-							>
+			<div class="overflow-x-auto -mx-1 px-1">
+				<table class="w-full text-right tabular-nums">
+					<thead>
+						<tr class="text-[0.6rem] uppercase tracking-widest text-base-content/35">
+							<th class="text-left font-medium pb-1">from the left</th>
+							{#each RUNS as run}
+								<th class="font-medium pb-1 pl-2">{run}×</th>
+							{/each}
+						</tr>
+					</thead>
+					<tbody>
+						{#each PAY_ROWS as row}
+							{@const s = SYMBOLS[row.icon]}
+							<tr class="border-t border-white/5">
+								<td class="text-left py-1.5">
+									<span class="inline-flex items-center gap-1.5">
+										<span
+											class="size-6 rounded-md grid place-items-center text-xs border border-black/20"
+											style="background:{s.color};color:{s.text}">{s.glyph}</span
+										>
+										<span class="text-sm text-base-content/70">
+											{row.cls === 'mana' ? 'Any colour' : s.label}
+										</span>
+									</span>
+								</td>
+								{#each RUNS as run}
+									<td class="py-1.5 pl-2 font-bold text-accent text-xs whitespace-nowrap">
+										{PAYS[row.cls][run] ? formatGold(PAYS[row.cls][run] * bet) : '—'}
+									</td>
+								{/each}
+							</tr>
 						{/each}
-					</div>
-					<div class="flex-1 text-sm text-fuchsia-300 truncate">
-						Anywhere → {SCATTER.freeSpins} free spins
-					</div>
-					<div class="font-bold tabular-nums text-accent whitespace-nowrap">
-						🪙{formatGold(SCATTER.payMult * stake)}
-					</div>
-				</div>
+					</tbody>
+				</table>
 			</div>
 
 			<p class="text-[0.7rem] text-base-content/40 mt-3 leading-relaxed">
 				<span class="inline-grid place-items-center size-4 rounded align-text-bottom" style="background:{SYMBOLS.wild.color};color:{SYMBOLS.wild.text}">{SYMBOLS.wild.glyph}</span>
 				is wild on any line but never substitutes for
 				<span class="inline-grid place-items-center size-4 rounded align-text-bottom" style="background:{SYMBOLS.scatter.color};color:{SYMBOLS.scatter.text}">{SYMBOLS.scatter.glyph}</span>,
-				which pays from anywhere on the grid and on the total bet. One win per line, best only.
-				Payouts are multipliers of your stake, so the return is identical at every bet and line
-				count — more lines buy more coverage, not better value. Reels are rolled on the server with
-				a cryptographic RNG, which also validates the stake.
+				which pays from anywhere on the grid and on the total bet. Lines pay left to right and only the
+				best win on a line counts. Payouts are multipliers of your stake, so the return is identical at
+				every bet and line count — more lines buy more coverage, not better value. The top prize is
+				{formatGold(PAYTABLE.wild5.mult)}× a line: 🪙{formatGold(PAYTABLE.wild5.mult * MAX_BET)} at the
+				top of the ladder. Reels are rolled on the server with a cryptographic RNG, which also
+				validates the stake.
 			</p>
 		</div>
 
@@ -410,14 +490,14 @@
 						<div class="text-[0.65rem] text-base-content/45">Spins</div>
 					</div>
 					<div>
-						<div class="text-lg font-black tabular-nums text-fuchsia-300">{formatGold(data.slots.bonuses)}</div>
-						<div class="text-[0.65rem] text-base-content/45">Bonuses</div>
+						<div class="text-lg font-black tabular-nums text-primary">{formatGold(data.slots.packsWon)}</div>
+						<div class="text-[0.65rem] text-base-content/45">Packs won</div>
 					</div>
 					<div>
 						<div class="text-lg font-black tabular-nums {data.slots.net >= 0 ? 'text-success' : 'text-error'}">
 							{data.slots.net >= 0 ? '+' : ''}{formatGold(data.slots.net)}
 						</div>
-						<div class="text-[0.65rem] text-base-content/45">Net gold</div>
+						<div class="text-[0.65rem] text-base-content/45">Net worth</div>
 					</div>
 					<div>
 						<div class="text-lg font-black tabular-nums">
@@ -426,6 +506,13 @@
 						<div class="text-[0.65rem] text-base-content/45">Your return</div>
 					</div>
 				</div>
+				{#if data.slots.best}
+					<div class="text-[0.7rem] text-base-content/45 mt-3 text-center">
+						Best spin: 🪙{formatGold(data.slots.best.win)}
+						{#if data.slots.best.label}· {data.slots.best.label}{/if}
+						{#if data.slots.best.pack}· {data.slots.best.pack}{/if}
+					</div>
+				{/if}
 			</div>
 		{/if}
 	</div>

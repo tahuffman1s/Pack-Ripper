@@ -102,7 +102,15 @@
 						⚡⚡ Rip all {g.count}
 					</button>
 				{/if}
-				<!-- sell-back controls -->
+				<!-- Sell-back controls. The counter pays market value, or the sale price
+				     while a sale is on — the shop never buys back above its own shelf
+				     price, so a discount temporarily lowers what a hoard is worth. Said
+				     here rather than discovered at the till. -->
+				{#if g.marketGold > g.sellGold}
+					<div class="px-3 pt-1 text-[0.65rem] text-warning">
+						On sale — buy-back is 🪙{formatGold(g.sellGold)}, down from 🪙{formatGold(g.marketGold)}.
+					</div>
+				{/if}
 				<div class="px-3 pb-3 pt-1 flex items-center gap-1.5 border-t border-white/5 mt-1">
 					<button
 						class="btn btn-xs btn-ghost flex-1 gap-1 text-base-content/70"

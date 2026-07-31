@@ -1,7 +1,7 @@
 <script>
 	import { enhance } from '$app/forms';
-	import { STARTING_GOLD, formatGold } from '$lib/economy.js';
-	let { form } = $props();
+	import { formatGold } from '$lib/economy.js';
+	let { form, data } = $props();
 	let loading = $state(false);
 </script>
 
@@ -27,7 +27,7 @@
 			class="card bg-base-100/70 backdrop-blur border border-white/5 shadow-xl"
 		>
 			<div class="card-body gap-4">
-				<h2 class="card-title">Sign up — get {formatGold(STARTING_GOLD)} gold</h2>
+				<h2 class="card-title">Sign up — get {formatGold(data.startingGold)} gold</h2>
 
 				{#if form?.error}
 					<div class="alert alert-error text-sm py-2">{form.error}</div>

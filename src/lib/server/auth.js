@@ -1,6 +1,6 @@
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { query, tx, makeId } from './db.js';
-import { STARTING_GOLD } from '../economy.js';
+import { startingGold } from './settings.js';
 
 export const SESSION_COOKIE = 'ripper_session';
 const SESSION_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
@@ -83,6 +83,9 @@ export async function createUser({ username, password }) {
 	const salt = randomBytes(16).toString('hex');
 	const passwordHash = hashPassword(password, salt);
 	const now = Date.now();
+	// The opening balance is a setting an admin can change, not a constant — read
+	// before the transaction opens, since it may be a query of its own.
+	const grant = await startingGold();
 
 	try {
 		return await tx(async (client) => {
@@ -92,10 +95,7 @@ export async function createUser({ username, password }) {
 				 RETURNING *`,
 				[id, username, key, passwordHash, salt, now]
 			);
-			await client.query('INSERT INTO wallets (user_id, gold) VALUES ($1, $2)', [
-				id,
-				STARTING_GOLD
-			]);
+			await client.query('INSERT INTO wallets (user_id, gold) VALUES ($1, $2)', [id, grant]);
 			await client.query('INSERT INTO stats (user_id, data) VALUES ($1, $2::jsonb)', [
 				id,
 				JSON.stringify(newStats())
@@ -133,7 +133,9 @@ export function newStats() {
 		slotSpins: 0,
 		slotWagered: 0,
 		slotWon: 0,
-		slotBest: null // { win, line, label, at }
+		slotPacksWon: 0,
+		slotPackGold: 0,
+		slotBest: null // { win, label, pack, lineBet, lines, at }
 	};
 }
 

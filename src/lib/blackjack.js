@@ -25,11 +25,26 @@ export const BLACKJACK_PAYOUT = 1.5; // 3:2
 export const MAX_HANDS = 4; // one original plus three splits
 export const DEALER_STANDS_ON = 17; // and stands on soft 17
 
-/** Bet ladder, mirroring the slot machine so the two games feel consistent. */
-export const BET_LEVELS = [25, 50, 100, 250, 500, 1000];
+/**
+ * Bet ladder. A fixed allow-list rather than a range, for the same reason as the
+ * slot machine's: the server validates the stake against this list instead of
+ * range-checking arbitrary input.
+ *
+ * It runs to a million a hand, which is the point of a table as opposed to a slot
+ * — blackjack at correct play gives back 99.5% of what crosses it, so it is the
+ * one game in the app where a serious bankroll can sensibly be put to work, and
+ * capping it at a thousand made that impossible. The bottom of the ladder stays at
+ * 25 so a player who has just been rescued from the bulk bin can still sit down.
+ *
+ * A double or a split needs the stake AGAIN, and a hand split three ways and
+ * doubled can therefore commit eight times the base bet. legalMoves() checks the
+ * balance for each of those against the locked wallet, so the top of the ladder is
+ * playable rather than nominal.
+ */
+export const BET_LEVELS = [25, 100, 500, 2_500, 10_000, 50_000, 250_000, 1_000_000];
 export const MIN_BET = BET_LEVELS[0];
 export const MAX_BET = BET_LEVELS[BET_LEVELS.length - 1];
-export const DEFAULT_BET = 100;
+export const DEFAULT_BET = 500;
 
 export function isValidBet(bet) {
 	return Number.isInteger(bet) && BET_LEVELS.includes(bet);

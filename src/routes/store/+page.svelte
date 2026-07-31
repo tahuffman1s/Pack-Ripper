@@ -25,6 +25,7 @@
 	});
 
 	const shown = $derived(groups.reduce((n, g) => n + g.sets.length, 0));
+	const onSale = $derived(data.sets.filter((s) => s.sale).length);
 </script>
 
 <svelte:head><title>Store · PackRipper</title></svelte:head>
@@ -43,6 +44,23 @@
 		{#if q}<button class="text-xs text-base-content/50" onclick={() => (q = '')}>clear</button>{/if}
 	</label>
 </div>
+
+<!-- One banner rather than a badge per tile when a sale is on: the sell-back
+     warning is the part people need to read, and it only needs saying once. -->
+{#if data.saleOn}
+	<div class="mb-4 rounded-2xl border border-warning/40 bg-warning/10 p-3 flex items-start gap-3">
+		<span class="text-2xl leading-none">🏷️</span>
+		<div class="min-w-0 text-sm">
+			<div class="font-bold">
+				Sale on{onSale && onSale < data.sets.length ? ` — ${onSale} ${onSale === 1 ? 'set' : 'sets'}` : ''}
+			</div>
+			<p class="text-base-content/60 text-xs mt-0.5">
+				While a sale runs, the counter pays the sale price too — the shop will never buy a pack back
+				for more than it is selling it for. Good time to buy, bad time to liquidate.
+			</p>
+		</div>
+	</div>
+{/if}
 
 {#if shown === 0}
 	<p class="text-center text-base-content/50 py-10">No sets match “{q}”.</p>
@@ -86,7 +104,11 @@
 								<div class="text-[0.6rem] text-base-content/40">{set.released}</div>
 							{:else}
 								<div class="font-bold text-accent text-sm whitespace-nowrap">🪙{formatGold(set.fromPrice)}</div>
-								<div class="text-[0.6rem] {set.live ? 'text-success/70' : 'text-base-content/40'}">{set.live ? '' : '≈'}{formatUsd(set.fromUsd)}</div>
+								{#if set.sale}
+									<div class="badge badge-xs badge-warning font-bold whitespace-nowrap">{set.sale.label}</div>
+								{:else}
+									<div class="text-[0.6rem] {set.live ? 'text-success/70' : 'text-base-content/40'}">{set.live ? '' : '≈'}{formatUsd(set.fromUsd)}</div>
+								{/if}
 							{/if}
 						</div>
 					</div>

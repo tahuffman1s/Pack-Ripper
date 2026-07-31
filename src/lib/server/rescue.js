@@ -14,7 +14,8 @@
 import { query, tx, lockGold, setGold, lockStats, writeStats, makeId } from './db.js';
 import { COLLECTION_SELL_VALUE_SQL } from './economySql.js';
 import { COLLECTION_COLUMNS, cardToValues, valuesClause } from './rows.js';
-import { packPriceGold } from './game.js';
+import { packSellGold } from './game.js';
+import { loadSales } from './sales.js';
 import { setEntry, storeSets } from './registry.js';
 import { getSetPool, cachedPoolCodes } from './scryfall.js';
 import { cardSellGold } from '../economy.js';
@@ -42,12 +43,15 @@ const MAX_CARDS = 15;
  * the vault is grouped by product, so the rows that come back are one per set and
  * pack type rather than one per card.
  *
- * The pack total still has to be finished in JS: packPriceGold() reads the live
- * TCGplayer cache and the vintage EV floors, which are in-process and not in
- * Postgres. Grouping is what makes that cheap — it is called once per distinct
+ * The pack total still has to be finished in JS: packSellGold() reads the live
+ * TCGplayer cache, the vintage EV floors and the active sale rules, all of which
+ * are in-process and not in Postgres. Grouping is what makes that cheap — it is called once per distinct
  * product, not once per pack.
  */
 export async function netWorthGold(userId) {
+	// What a pack is worth at the counter moves with an active sale, and being
+	// stuck is decided on what the player could actually realise.
+	await loadSales();
 	const [walletAndCards, byProduct] = await Promise.all([
 		query(
 			`SELECT COALESCE((SELECT gold FROM wallets WHERE user_id = $1), 0) AS gold,
@@ -68,7 +72,7 @@ export async function netWorthGold(userId) {
 	let packs = 0;
 	for (const r of byProduct.rows) {
 		const set = setEntry(r.set_code);
-		if (set) packs += packPriceGold(set, r.pack_type_id) * r.count;
+		if (set) packs += packSellGold(set, r.pack_type_id) * r.count;
 	}
 
 	return { gold, cards, packs, total: gold + cards + packs };

@@ -1,5 +1,6 @@
 import { error } from '@sveltejs/kit';
 import { summary, listUsers, auditLog, grantableSets } from '$lib/server/admin.js';
+import { listSales } from '$lib/server/sales.js';
 import { PACK_TYPE_ORDER } from '$lib/packs.js';
 
 /**
@@ -15,12 +16,18 @@ import { PACK_TYPE_ORDER } from '$lib/packs.js';
 export async function load({ locals }) {
 	if (!locals.user?.admin) throw error(404, 'Not found');
 
-	const [summaryData, users, log] = await Promise.all([summary(), listUsers(), auditLog(40)]);
+	const [summaryData, users, log, sales] = await Promise.all([
+		summary(),
+		listUsers(),
+		auditLog(40),
+		listSales()
+	]);
 
 	return {
 		summary: summaryData,
 		users,
 		log,
+		sales,
 		sets: grantableSets(),
 		packTypeOrder: PACK_TYPE_ORDER
 	};

@@ -18,6 +18,15 @@ import { packPriceUsd as heurPackUsd, boxPriceUsd as heurBoxUsd, sealedPremium }
 import { getSealed } from './tcgplayer.js';
 import { usdToGold, cardMarketGold, cardSellGold } from '../economy.js';
 import { newStats } from './auth.js';
+import {
+	loadSales,
+	saleFor,
+	saleForClient,
+	saleLabel,
+	discountedPrice,
+	bonusUnits
+} from './sales.js';
+import { announce, pruneAnnouncements, cardAnnouncement } from './announce.js';
 
 /** How many rip summaries are kept per player. */
 const OPENINGS_KEPT = 30;
@@ -93,6 +102,9 @@ export async function inventoryCount(userId) {
  * list is what bounds a rip to packs the player actually holds.
  */
 export async function inventorySummary(userId) {
+	// The sell-back figure moves with an active sale, so the rules have to be in
+	// the cache before any price is quoted.
+	await loadSales();
 	const { rows } = await query(
 		`SELECT set_code, pack_type_id, count(*)::int AS count, array_agg(id ORDER BY acquired_at, id) AS ids
 		   FROM inventory WHERE user_id = $1
@@ -111,8 +123,10 @@ export async function inventorySummary(userId) {
 				packTypeId: r.pack_type_id,
 				packName: type?.name || r.pack_type_id,
 				accent: type?.accent || 'primary',
-				// what one unopened pack sells back for (full current market value)
-				sellGold: set ? packPriceGold(set, r.pack_type_id) : 0,
+				// What one unopened pack sells back for — market value, or the sale
+				// price while a sale is on. See packSellGold.
+				sellGold: set ? packSellGold(set, r.pack_type_id) : 0,
+				marketGold: set ? packPriceGold(set, r.pack_type_id) : 0,
 				count: r.count,
 				ids: r.ids
 			};
@@ -200,6 +214,50 @@ export function boxPriceGold(set, packTypeId) {
 	return usdToGold(boxPriceUsd(set, packTypeId));
 }
 
+// ── Sale prices ────────────────────────────────────────────────
+//
+// `packPriceGold` above is the MARKET price and stays that way — it is what the
+// product is worth, and a sale does not change that. These three are what the
+// store charges and what the counter pays, and the distinction matters on every
+// path that moves gold. All three are synchronous: sales.js keeps the live rules
+// in a cache that `loadSales()` fills, and every caller that quotes a price awaits
+// that first.
+
+/** What the store charges for one pack right now. */
+export function packBuyGold(set, packTypeId) {
+	return discountedPrice(packPriceGold(set, packTypeId), saleFor(set.code, packTypeId));
+}
+
+/** What the store charges for one box right now. */
+export function boxBuyGold(set, packTypeId) {
+	return discountedPrice(boxPriceGold(set, packTypeId), saleFor(set.code, packTypeId));
+}
+
+/**
+ * What the counter pays for one unopened pack.
+ *
+ * Market value, capped by what the store is currently charging for the same
+ * thing — including the effective per-pack price of a buy-one-get-one, where the
+ * shelf price is unchanged but two packs leave for the price of one.
+ *
+ * Without the cap a discount is a gold printer: buy at half price, sell back at
+ * full price, repeat, unbounded. With it the loop closes exactly, because you can
+ * never sell a pack back for more than you could buy it for. It also means a sale
+ * temporarily lowers what a hoard of packs is worth, which is said out loud in the
+ * store rather than left to be discovered.
+ */
+export function packSellGold(set, packTypeId) {
+	const market = packPriceGold(set, packTypeId);
+	const sale = saleFor(set.code, packTypeId);
+	if (!sale) return market;
+	if (sale.kind === 'percent') return discountedPrice(market, sale);
+	// A BOGO's shelf price is the market price, but N+M packs leave for N packs'
+	// worth of gold, so a pack effectively costs N/(N+M) of the price.
+	const buy = sale.buyQty || 1;
+	const get = sale.getQty || 1;
+	return Math.max(0, Math.floor((market * buy) / (buy + get)));
+}
+
 /**
  * Make sure the vintage floor for this product exists before money moves.
  *
@@ -232,10 +290,27 @@ export function priceIsLive(set, packTypeId, kind = 'pack') {
 	return !!(v && v > 0);
 }
 
-/** Cheapest pack price (gold) for a set, for "from X" labels. */
+/** Cheapest pack price (gold) for a set, for "from X" labels. What it costs today. */
 export function fromPriceGold(set) {
-	const prices = (set.packTypes || []).map((t) => packPriceGold(set, t));
+	const prices = (set.packTypes || []).map((t) => packBuyGold(set, t));
 	return prices.length ? Math.min(...prices) : 0;
+}
+
+/** The best sale running on any of a set's products, for the store index badge. */
+export function bestSaleForSet(set) {
+	let best = null;
+	let bestRate = 1;
+	for (const t of set.packTypes || []) {
+		const sale = saleFor(set.code, t);
+		if (!sale) continue;
+		const full = packPriceGold(set, t);
+		const rate = full > 0 ? packSellGold(set, t) / full : 1;
+		if (rate < bestRate) {
+			bestRate = rate;
+			best = sale;
+		}
+	}
+	return best ? saleForClient(best) : null;
 }
 
 /** Store products (pack + box) for a set, priced for the current date. */
@@ -254,8 +329,12 @@ export function productsForSet(set) {
 		const t = PACK_TYPES[packTypeId];
 		if (!t) continue;
 		if (real && !real.includes(packTypeId) && !priceIsLive(set, packTypeId, 'pack')) continue;
-		const packGold = packPriceGold(set, packTypeId);
-		const boxGold = boxPriceGold(set, packTypeId);
+		const sale = saleFor(set.code, packTypeId);
+		const forClient = saleForClient(sale);
+		const packFull = packPriceGold(set, packTypeId);
+		const boxFull = boxPriceGold(set, packTypeId);
+		const packGold = discountedPrice(packFull, sale);
+		const boxGold = discountedPrice(boxFull, sale);
 		products.push({
 			kind: 'pack',
 			setCode: set.code,
@@ -265,8 +344,13 @@ export function productsForSet(set) {
 			accent: t.accent,
 			blurb: t.blurb,
 			priceGold: packGold,
+			fullPriceGold: packFull,
 			priceUsd: Number(packPriceUsd(set, packTypeId).toFixed(2)),
-			live: priceIsLive(set, packTypeId, 'pack')
+			live: priceIsLive(set, packTypeId, 'pack'),
+			sale: forClient,
+			// What the counter would pay for one right now, so a tile can be honest
+			// about a BOGO leaving a hoard worth less than it was yesterday.
+			sellGold: packSellGold(set, packTypeId)
 		});
 		const size = boxSizeFor(set, packTypeId);
 		const perPack = boxGold / size;
@@ -280,8 +364,11 @@ export function productsForSet(set) {
 			accent: t.accent,
 			blurb: savings > 0 ? `${size} packs — save ${savings}% vs singles.` : `Sealed box of ${size} packs.`,
 			priceGold: boxGold,
+			fullPriceGold: boxFull,
 			priceUsd: Number(boxPriceUsd(set, packTypeId).toFixed(2)),
-			live: priceIsLive(set, packTypeId, 'box') || priceIsLive(set, packTypeId, 'pack')
+			live: priceIsLive(set, packTypeId, 'box') || priceIsLive(set, packTypeId, 'pack'),
+			sale: forClient,
+			sellGold: packSellGold(set, packTypeId) * size
 		});
 	}
 	return products;
@@ -308,7 +395,7 @@ function unitPacks(set, packTypeId, kind) {
 
 /** Largest quantity of this product a purchase may be, for the UI's "Max". */
 export function maxBuyQty(set, packTypeId, kind, gold) {
-	const unit = kind === 'box' ? boxPriceGold(set, packTypeId) : packPriceGold(set, packTypeId);
+	const unit = kind === 'box' ? boxBuyGold(set, packTypeId) : packBuyGold(set, packTypeId);
 	if (!(unit > 0)) return 0;
 	const byCap = Math.floor(MAX_BUY_PACKS / unitPacks(set, packTypeId, kind));
 	return Math.max(0, Math.min(byCap, Math.floor((gold || 0) / unit)));
@@ -349,14 +436,23 @@ export async function buy(userId, { setCode, packTypeId, kind, qty = 1 }) {
 	const per = unitPacks(set, packTypeId, kind);
 	const units = Math.floor(Number(qty) || 0);
 	if (units < 1) return { ok: false, error: 'Choose how many to buy.' };
-	if (units * per > MAX_BUY_PACKS) {
-		return { ok: false, error: `That is over the ${MAX_BUY_PACKS.toLocaleString()}-pack limit for one order.` };
-	}
 
 	await ensureVintageFloor(set, packTypeId);
-	const unitPrice = kind === 'box' ? boxPriceGold(set, packTypeId) : packPriceGold(set, packTypeId);
+	// The sale rules are read here rather than trusted from the page that quoted
+	// the price: the price the store charges is the server's to decide, and a sale
+	// may have ended between the page render and the button.
+	await loadSales();
+	const sale = saleFor(setCode, packTypeId);
+
+	const unitPrice = kind === 'box' ? boxBuyGold(set, packTypeId) : packBuyGold(set, packTypeId);
 	const price = unitPrice * units;
-	const added = units * per;
+	// Free units from a buy-one-get-one. Counted against the order cap along with
+	// the paid ones, so the deal cannot be a way past it.
+	const freeUnits = bonusUnits(units, sale);
+	const added = (units + freeUnits) * per;
+	if (added > MAX_BUY_PACKS) {
+		return { ok: false, error: `That is over the ${MAX_BUY_PACKS.toLocaleString()}-pack limit for one order.` };
+	}
 
 	return tx(async (client) => {
 		const gold = await lockGold(client, userId);
@@ -371,7 +467,16 @@ export async function buy(userId, { setCode, packTypeId, kind, qty = 1 }) {
 		if (kind === 'box') s.boxesOpened = (s.boxesOpened || 0) + units;
 		await writeStats(client, userId, s);
 
-		return { ok: true, added, units, price, gold: gold - price };
+		return {
+			ok: true,
+			added,
+			units,
+			freeUnits,
+			price,
+			sale: saleForClient(sale),
+			saleLabel: sale ? saleLabel(sale) : null,
+			gold: gold - price
+		};
 	});
 }
 
@@ -558,7 +663,13 @@ function foldPackIntoStats(s, item, pack) {
  * @param {{item:object, pack:object}[]} opened
  * @returns {Promise<{item:object, pack:object}[]>} the subset actually banked
  */
-async function commitOpenings(client, userId, opened, now) {
+/** A player's display name, for announcements. One query, read once per rip. */
+async function usernameOf(userId) {
+	const { rows } = await query('SELECT username FROM users WHERE id = $1', [userId]);
+	return rows[0]?.username || 'someone';
+}
+
+async function commitOpenings(client, userId, opened, now, username = null) {
 	const { rows: claimed } = await client.query(
 		'DELETE FROM inventory WHERE user_id = $1 AND id = ANY($2::text[]) RETURNING id',
 		[userId, opened.map((o) => o.item.id)]
@@ -569,6 +680,9 @@ async function commitOpenings(client, userId, opened, now) {
 
 	const cards = [];
 	const s = await lockStats(client, userId);
+	// Cards that earned a server-wide announcement. Collected rather than written
+	// as they are found so the prune below runs once per chunk instead of per card.
+	const news = [];
 
 	for (const { item, pack } of banked) {
 		// Serials are claimed here rather than at roll time so that a rip which
@@ -579,12 +693,21 @@ async function commitOpenings(client, userId, opened, now) {
 			c.acquiredAt = now;
 			c.sold = false;
 			cards.push(c);
+			if (username) {
+				const worthTelling = cardAnnouncement(c, username);
+				if (worthTelling) news.push({ ...worthTelling, image: c.images?.normal || null });
+			}
 		}
 		foldPackIntoStats(s, item, pack);
 	}
 
 	await insertCards(client, userId, cards);
 	await writeStats(client, userId, s);
+
+	// Inside the transaction, so an announcement about a card is only ever posted
+	// if that card was really banked. A rip that rolls back takes its news with it.
+	for (const n of news) await announce(client, { ...n, username });
+	if (news.length) await pruneAnnouncements(client);
 
 	// Only the most recent OPENINGS_KEPT survive the prune below, so a batch
 	// bigger than that logs its tail and nothing else. Writing all of a
@@ -633,7 +756,10 @@ export async function openPack(userId, inventoryId) {
 	const pack = await rollPack(item, await issuedLookup());
 	if (!pack) return { ok: false, error: `Card data for ${item.setCode.toUpperCase()} is unavailable.` };
 
-	const banked = await tx((client) => commitOpenings(client, userId, [{ item, pack }], Date.now()));
+	const username = await usernameOf(userId);
+	const banked = await tx((client) =>
+		commitOpenings(client, userId, [{ item, pack }], Date.now(), username)
+	);
 	if (!banked.length) return { ok: false, error: 'That pack is already open.' };
 
 	return { ok: true, pack, gold: (await getWallet(userId)).gold };
@@ -761,6 +887,7 @@ export async function openPacks(userId, { setCode, packTypeId, ids, count, onPro
 	}
 
 	const issuedFor = await issuedLookup();
+	const username = await usernameOf(userId);
 	const tally = newRipTally();
 	const failed = [];
 	let alreadyOpen = 0;
@@ -781,7 +908,9 @@ export async function openPacks(userId, { setCode, packTypeId, ids, count, onPro
 		}
 		if (!opened.length) continue;
 
-		const banked = await tx((client) => commitOpenings(client, userId, opened, Date.now()));
+		const banked = await tx((client) =>
+			commitOpenings(client, userId, opened, Date.now(), username)
+		);
 		alreadyOpen += opened.length - banked.length;
 		foldIntoTally(tally, banked);
 		onProgress?.({
@@ -847,7 +976,12 @@ export async function sellCards(userId, uids) {
 	});
 }
 
-/** Sell unopened packs back to the store at full current market value. */
+/**
+ * Sell unopened packs back to the store.
+ *
+ * At full market value normally, and at the sale price while a sale is on — see
+ * packSellGold for why the cap is not optional.
+ */
 export async function sellPacks(userId, { setCode, packTypeId, qty = 1 }) {
 	setCode = String(setCode || '').toLowerCase();
 	const set = setEntry(setCode);
@@ -855,7 +989,8 @@ export async function sellPacks(userId, { setCode, packTypeId, qty = 1 }) {
 	// Buying and selling have to agree about what a pack is worth. If only one of
 	// them waits for the floor, the gap between them is free gold.
 	await ensureVintageFloor(set, packTypeId);
-	const unit = packPriceGold(set, packTypeId);
+	await loadSales();
+	const unit = packSellGold(set, packTypeId);
 	const want = Math.max(0, Math.floor(Number(qty) || 0));
 	if (!want) return { ok: false, error: 'No matching packs to sell.' };
 
@@ -882,6 +1017,49 @@ export async function sellPacks(userId, { setCode, packTypeId, qty = 1 }) {
 
 		return { ok: true, sold, earned, gold: gold + earned };
 	});
+}
+
+/**
+ * Take unopened packs out of a vault, paying nothing for them.
+ *
+ * The admin counterpart of a grant, and deliberately not "sell them on the
+ * player's behalf": a moderator removing packs is undoing something, not
+ * transacting, so no gold changes hands and stats are untouched. Oldest first,
+ * matching sellPacks, so removing 5 of 20 leaves the 15 most recently acquired.
+ *
+ * Scoped by set and product when given, or the whole vault when neither is.
+ * Returns what actually went, which is what the audit entry records.
+ */
+export async function removePacks(client, userId, { setCode, packTypeId, qty } = {}) {
+	const wanted = qty == null ? null : Math.max(0, Math.floor(Number(qty) || 0));
+	if (wanted === 0) return { removed: 0 };
+
+	const { rows } = await client.query(
+		`DELETE FROM inventory WHERE id IN (
+		   SELECT id FROM inventory
+		    WHERE user_id = $1
+		      AND ($2::text IS NULL OR set_code = $2)
+		      AND ($3::text IS NULL OR pack_type_id = $3)
+		    ORDER BY acquired_at, id
+		    LIMIT $4
+		 )
+		 RETURNING set_code, pack_type_id`,
+		[
+			userId,
+			setCode ? String(setCode).toLowerCase() : null,
+			packTypeId || null,
+			// A null LIMIT is "no limit" in Postgres, which is exactly what "remove
+			// everything matching" wants — no sentinel number standing in for it.
+			wanted
+		]
+	);
+
+	const byProduct = {};
+	for (const r of rows) {
+		const key = `${r.set_code}:${r.pack_type_id}`;
+		byProduct[key] = (byProduct[key] || 0) + 1;
+	}
+	return { removed: rows.length, byProduct };
 }
 
 /**

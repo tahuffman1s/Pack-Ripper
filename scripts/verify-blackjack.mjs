@@ -235,11 +235,11 @@ if (shoe.length !== DECKS * 52) problems.push(`shoe is ${shoe.length} cards, exp
 }
 
 // ── 7. Bet validation ──────────────────────────────────────────
-for (const b of [0, -100, -1, 1, 24, 1001, 1e9, 25.5, NaN, Infinity, {}, []]) {
+for (const b of [0, -100, -1, 1, 24, 1000, 1001, 999_999, 1_000_001, 1e9, 25.5, NaN, Infinity, {}, []]) {
 	if (isValidBet(b)) problems.push(`invalid bet accepted: ${String(b)}`);
 }
 for (const b of BET_LEVELS) if (!isValidBet(b)) problems.push(`valid bet rejected: ${b}`);
-for (const gold of [0, 1, 24, 25, 999, 1000, 99999]) {
+for (const gold of [0, 1, 24, 25, 999, 1000, 99_999, 1_000_000, 5_000_000]) {
 	const m = maxAffordableBet(gold);
 	if (m !== null && m > gold) problems.push(`maxAffordableBet(${gold}) unaffordable: ${m}`);
 	for (const dir of [-1, 1]) {

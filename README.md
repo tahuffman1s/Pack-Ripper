@@ -11,7 +11,7 @@ It's a simulator: the currency is free and no real money is ever involved.
 
 - **Login system** — username/password accounts with hashed passwords (scrypt) and session
   cookies — username and password only, nothing else asked for. Every new account starts with
-  **100,000 free gold**.
+  **100,000 free gold**, or whatever an admin has set the opening grant to.
 - **Store** — every booster-eligible MTG set from 1993 to today, each offering the booster
   products it actually shipped with:
   - **Draft Boosters** (classic 15-card packs, pre-2024)
@@ -60,33 +60,60 @@ It's a simulator: the currency is free and no real money is ever involved.
   real TCGplayer sealed-market prices** (via tcgcsv.com) — a Tempest booster really costs ~🪙10,040
   ($100), a modern pack ~🪙500. Card values come from live Scryfall USD prices. Sell at an 85%
   buylist rate. Sets without a live listing fall back to an MSRP×vintage estimate (shown with ≈).
-- **Mana Machine** — a 2D slot machine: 3 reels × 3 rows, **5 paylines**, and a **free-spin bonus
-  round**. Each reel is a strip of 24 physical stops scrolled behind a three-row window in plain
-  DOM and CSS; odds come from how often a symbol appears on its reel strip, the same way a mechanical
-  slot works — and the same way pack collation works here. Winning cells light up in place and the
-  paylines are traced across the window, so the reels *are* the result readout. Because the 3×3
-  window is fully determined by the three reel stops, the whole game is solvable exactly:
-  `node scripts/verify-slots.mjs` enumerates all 24³ = 13,824 outcomes across every payline and the
-  bonus round.
+- **Mana Machine** — a 2D slot machine: **5 reels × 3 rows, 9 paylines**, a **free-spin bonus
+  round**, and prizes paid in **gold *and* real booster packs**. Each reel is a strip of 24 physical
+  stops scrolled behind a three-row window in plain DOM and CSS; odds come from how often a symbol
+  appears on its reel strip, the same way a mechanical slot works — and the same way pack collation
+  works here. Winning cells light up in place and the paylines are traced across the window, so the
+  reels *are* the result readout. Because the 5×3 window is fully determined by the five reel stops,
+  the whole game is solvable exactly: `node scripts/verify-slots.mjs` enumerates all 24⁵ = 7,962,624
+  outcomes across every payline, the bonus round and the pack prizes, in about 270 ms.
 
   | | |
   |---|---|
-  | Return to player | 94.03% — identical at every bet and line count |
-  | Hit rate | 31.9% on 1 line, 81.6% on 5 |
-  | Paylines | middle, top, bottom, and both diagonals |
-  | Bet | 🪙5–200 per line × 1/3/5 lines (🪙5–1,000 a spin) |
-  | Free spins | 3+ 📦 Boosters anywhere → 8 free spins, 1 in 64 |
-  | Top line prize | 🪙120,000 |
+  | Return to player | **94.33%** — identical at every bet and line count (84.34% gold + 9.99% packs) |
+  | Hit rate | **83.6%** of spins pay something; 17.9% pay back at least the stake |
+  | Paylines | 9, and they cover all nine distinct openings on the first two reels |
+  | Bet | 🪙5–1,000 per line × 1/3/5/9 lines (🪙5–9,000 a spin) |
+  | Pack prizes | 3 📦 → a booster (1 in 29) · 4 📦 → a premium pack (1 in 303) · 5 📦 → a grail (1 in 8,192) |
+  | Free spins | 3+ 📦 anywhere → 4/8/15 free spins, 1 in 26 spins |
+  | Top line prize | 🪙1,800,000 (five ⚡ at the top of the ladder) |
+
+  **Pack prizes are a budget, not a named product.** Three Boosters is worth about your stake, four
+  is worth ten times it, five is worth a hundred and fifty times it — and the shop hands over
+  something it really sells for about that much, paying the difference as change in gold. That one
+  decision is what makes three things true at once: cheap packs are the common prize and vintage
+  grails the rarest, a bigger stake wins better packs, and the published return stays *exactly* a
+  multiple of the stake, because a pack that sells back for its budget and the budget itself are
+  worth the same. A budget too small for anything on the shelf simply arrives as gold rather than
+  rounding up to the cheapest pack in Magic's history. Vintage product whose EV floor has not been
+  computed yet is excluded from the prize pool outright — a prize picked against a cold $43 Alpha
+  booster and sold back against the warm $21,175 one is a money printer.
+
+  **Paylines are chosen, not decorated.** Every win starts with reels one and two matching, and the
+  window offers three cells on each, so there are exactly nine distinct openings. Nine paylines drawn
+  carelessly ask the same question two or three times over; the nine here cover all nine openings,
+  which is worth **20 percentage points of hit rate** and costs nothing, because every payline has the
+  same expected value whatever shape it is. The verifier asserts it.
 
   ⚡ is wild on any line but never substitutes for 📦, which pays from anywhere on the grid and on
-  the total bet. Payouts are multipliers of the stake, so more lines buy more **coverage, not better
-  value** — the verifier asserts the RTP is identical at 1, 3 and 5 lines rather than assuming it.
-  Free spins are **server state**: they survive a reload, lock in the stake that triggered them, cost
-  nothing, and cannot retrigger (which is exactly the model the RTP solver folds in as a ×1.125
-  uplift). The spin is rolled server-side with `node:crypto`; stake and line count are the only
-  things the client supplies and both are validated against allow-lists, so a crafted negative or
-  off-ladder bet cannot mint gold. Debit, roll, credit and bonus bookkeeping happen in one atomic
-  mutation, so a spin can never half-apply.
+  the total bet. Lines pay left to right, two of a kind and up, best win per line only. Payouts are
+  multipliers of the stake, so more lines buy more **coverage, not better value** — the verifier
+  asserts the return is identical at 1, 3, 5 and 9 lines rather than assuming it. Free spins are
+  **server state**: they survive a reload, lock in the stake that triggered them, cost nothing, and
+  cannot retrigger (which is exactly the model the RTP solver folds in as a ×1.166 uplift) — though
+  they *can* still win a pack. The spin is rolled server-side with `node:crypto`; stake and line count
+  are the only things the client supplies and both are validated against allow-lists, so a crafted
+  negative or off-ladder bet cannot mint gold. Debit, roll, credit, the pack prize and bonus
+  bookkeeping all happen in one transaction, so a spin can never half-apply.
+
+  The verifier reports two hit rates and both matter. A two-of-a-kind pays one times the *line* bet,
+  which on nine lines is a ninth of what the spin cost — a win the machine announces and a loss the
+  balance records. So alongside "paid something" it counts **"paid back at least the stake"**
+  exactly, and the paytable is shaped around that second number: three Foils pays 9× and three
+  Mythics 12×, both of which clear a nine-line stake, funded by trimming the five-of-a-kind
+  multipliers where it costs almost nothing in felt generosity.
+
 - **Mystery Boosters** are their own product line, not a Draft or Collector Booster with a different
   name. MTGJSON carries their real 121-card print sheets, and a pack takes exactly one card from
   each: white ×2, blue ×2, black ×2, red ×2, green ×2, land/multicolour/colourless, rare-or-mythic,
@@ -117,6 +144,13 @@ It's a simulator: the currency is free and no real money is ever involved.
   mana colours. **House edge 0.47% with correct play**, and there is a built-in basic-strategy hint
   that runs the exact same table the verifier uses to measure that edge.
 
+  The bet ladder runs **🪙25 to 🪙1,000,000 a hand**, which is the point of a table as opposed to a
+  slot: blackjack gives back 99.5% of what crosses it, so it is the one game here where a serious
+  bankroll can sensibly be put to work. A split-three-ways-and-doubled hand commits eight times the
+  base bet, and every one of those commitments is checked against the locked wallet, so the top of the
+  ladder is playable rather than nominal. The bottom stays at 🪙25 so a player who has just been
+  rescued from the bulk bin can still sit down.
+
   `node scripts/verify-blackjack.mjs` can't enumerate blackjack the way the slot is enumerated, so
   it does three things instead: checks hand evaluation **exhaustively** over all 8,554 distinct
   2–5 card hands (including that a soft hand can never bust on the next card), chi-square tests the
@@ -136,13 +170,50 @@ It's a simulator: the currency is free and no real money is ever involved.
   pack buy-back value), so it cannot be claimed while you still have a move. Individual cards are
   value-capped, so the bin never hands out a chase mythic. If card data is unavailable entirely,
   it falls back to plain gold — the failsafe must never itself fail.
-- **Collection** — filter (rare+/foil/by set), sort (value/rarity/newest), inspect any card,
-  and sell singles or bulk-select for a mass sale.
+- **Collection** — filter (rare+/foil/by set), sort (value/rarity/newest), and sell singles or
+  bulk-select for a mass sale.
+- **Cards you can pick up.** Tap any card — in the collection, in a rip summary, in a mass-open
+  result — and it opens **large and in 3D**. It tilts as the pointer moves across it, which is what
+  makes the foil overlay read as foil rather than as a gradient labelled "foil". Drag it anywhere on
+  the screen and it comes with you. Tap it and it **turns over**: for a transforming or modal
+  double-faced card the back is the *real second face*, fetched once per printing from Scryfall and
+  cached on disk forever (a printing's faces never change); for everything else it is a drawn
+  PackRipper back. Drag and flip share the pointer and are told apart the way physical objects do
+  it — a drag that went nowhere was a tap.
 - **Stats** — packs/boxes opened, cards opened/sold, gold spent/earned, net profit, mythics /
   rares / foils pulled, best pull ever, collection value, and most-opened sets.
-- **Admin panel + CLI** — hand out gold and packs, promote admins, reset passwords, delete
-  accounts. Same actions from `/admin` in the browser or `./admin.sh` on the host, every one of
-  them written to an audit trail. See [Admin](#admin).
+- **Leaderboard** — eight boards off **one query**: richest, best collection, biggest single pull,
+  most cards, most packs ripped, serial hunters, and net gold on the slots and at the table. Your own
+  placing is shown on every board even when it is outside the top ten, because "you are 14th of 73"
+  is the reason to come back. The temptation here was a helper that ranks players by a metric, called
+  eight times — eight passes over every card in the database for a page anyone can load. Every
+  per-player figure is aggregated once instead, and the boards are sorts of that one result set.
+- **System announcements** — when someone pulls something extraordinary the whole server hears about
+  it: a toast slides in over whatever page you are on, and the full week's history lives on the
+  leaderboard. Three things earn one, and the thresholds are the point. A **serialized card**, always
+  — there is exactly one 3/50 of that card in existence and it has just been claimed forever. A card
+  worth **🪙50,000 or more**, which is a real-money threshold ($500) rather than a rarity one, because
+  a bulk mythic is not news. And a slot win of **100× the stake**, plus every Booster Vault. The
+  board is polled, not pushed: a websocket for a message every few minutes would be a connection per
+  player held open all day, and the poll is one indexed lookup that normally returns nothing. A hidden
+  tab does not poll at all.
+- **Store sales** — an admin can put the shop on sale: a **percentage off** or a **buy-N-get-M-free**,
+  scoped to one set, one product, both, or everything. A sale is a *rule*, not a price, and the store
+  derives what it charges from whichever live rule is the best deal for a product — so 30% off and buy
+  2 get 1 are directly comparable (0.70 versus 0.667, and the BOGO wins).
+
+  There is one non-obvious consequence, and it is deliberate: **while a sale runs, the counter pays
+  the sale price too.** Unopened packs sell back at full market value, which is a long-standing rule
+  here — a sealed pack is worth what a sealed pack is worth — and a discount breaks it: buy at half
+  price, sell back at full price, repeat, and the store is an unbounded gold printer. Capping buy-back
+  at what the store is currently charging closes the loop exactly, including the effective per-pack
+  price of a BOGO, and it is how a real shop behaves. The visible effect is that a sale temporarily
+  lowers what a hoard of packs is worth, which the store and the packs screen both say out loud
+  rather than leaving to be discovered at the till.
+- **Admin panel + CLI** — hand out gold and packs, **take packs back**, run **store sales**, change
+  the **opening gold grant** for new accounts, promote admins, reset passwords, delete accounts.
+  Same actions from `/admin` in the browser or `./admin.sh` on the host, every one of them written to
+  an audit trail. See [Admin](#admin).
 - **Mobile-first UI** with DaisyUI on a custom arcane/foil dark theme.
 
 ## Tech stack
@@ -319,8 +390,9 @@ SQL now does the arithmetic in double precision and uses `FLOOR(x + 0.5)`, which
 ## Admin
 
 There is a panel at **`/admin`** and a CLI at **`./admin.sh`**. Both do the same things — give a
-player gold, drop packs into their vault, promote another admin, reset a password, sign someone
-out, clear a wedged blackjack hand, delete an account — and both go through one dispatch table in
+player gold, drop packs into their vault or take them back out, put the store on sale, change what a
+new account is handed, promote another admin, reset a password, sign someone out, clear a wedged
+blackjack hand, delete an account — and both go through one dispatch table in
 `src/lib/server/admin.js`, so they cannot drift apart. Every action is appended to an audit trail
 that the panel shows at the bottom of the page and `./admin.sh log` prints.
 
@@ -358,6 +430,16 @@ Azure — then restart. `./run.sh restart` locally; a new revision in the Portal
 ./admin.sh gold travis 50000          # add gold; a negative amount takes it away
 ./admin.sh gold travis 1000 --set     # set the balance outright
 ./admin.sh packs travis fdn play 36   # grant a box of Foundations Play Boosters, free
+./admin.sh take-packs travis 5        # remove 5 packs, oldest first, no refund
+./admin.sh take-packs travis --all --set fdn   # or every Foundations pack they own
+./admin.sh starting-gold              # what a new account is handed
+./admin.sh starting-gold 250000       # change it (existing balances untouched)
+./admin.sh sale 25% --days 3          # 25% off everything for three days
+./admin.sh sale 40% --product collector --label "Collector Crunch"
+./admin.sh sale buy 2 get 1 --set fdn # buy two Foundations packs, get a third free
+./admin.sh sales                      # every sale rule, live or not, numbered
+./admin.sh sale off 1                 # switch #1 off (sale delete 1 removes it)
+./admin.sh sales-end                  # switch every sale off
 ./admin.sh passwd travis newsecret    # set a password, signing them out everywhere
 ./admin.sh unstick travis             # clear a wedged blackjack hand / free spins
 ./admin.sh delete someone --yes       # delete an account and everything on it
@@ -859,6 +941,11 @@ src/
       registry.js         in-memory set index, annotated with real products
       game.js             buy / open / sell / stats orchestration
       admin.js            every privileged action, in one dispatch table
+      sales.js            store sale rules, and the buy-back cap that closes them
+      settings.js         the handful of values an admin can change without a deploy
+      announce.js         the server-wide noticeboard, and what earns a place on it
+      leaderboard.js      eight boards, one aggregate query
+      packprize.js        turning a slot prize budget into a real booster pack
   routes/
     +layout.svelte        app shell (top bar + bottom nav)
     (login|register|logout)
@@ -868,10 +955,13 @@ src/
     slots/                the Mana Machine
     blackjack/            the blackjack table
     collection/           owned cards + selling
+    leaderboard/          eight boards + the week's announcements
     stats/                statistics
     admin/                the admin panel (404 unless you are one)
     api/(open|sell|spin| JSON endpoints for the interactive flows
-        rescue|blackjack)
+        rescue|blackjack|
+        announcements|
+        card-faces)
     api/admin/            the one admin entry point (session cookie or ADMIN_TOKEN)
     api/health/           liveness, for HEALTHCHECK and the Azure probes
 admin.sh                  admin commands, for the container host
@@ -899,7 +989,12 @@ deploy/
 
 ## Notes & knobs
 
-- Starting gold, the gold/USD rate, and the sell rate live in `src/lib/economy.js`.
+- The gold/USD rate and the sell rate live in `src/lib/economy.js`. So does the *default* starting
+  gold — the live figure is a row in `settings`, changed from the panel or `./admin.sh starting-gold`,
+  and it falls back to the constant when there is no row. Only values whose alternative is "edit a
+  constant and redeploy" belong in that table; anything that is part of the game's maths (the sell
+  rate, the bet ladders, the paytable) stays a constant, because that is what the verifier scripts
+  check.
 - Product metadata and MSRPs live in `src/lib/packs.js`. Slot structures are **not** defined
   there any more — they come from MTGJSON.
 - The set line-up (and which products each set offers) lives in `src/lib/catalog.js`.

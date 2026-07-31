@@ -157,6 +157,62 @@ CREATE TABLE IF NOT EXISTS free_spins (
 	lines     integer NOT NULL
 );
 
+-- Server-wide configuration an admin can change without a redeploy. One row per
+-- setting, value as jsonb so a setting can be a number, a flag or an object
+-- without a migration. Deliberately tiny: a setting belongs here only when the
+-- alternative is an environment variable and a container restart.
+CREATE TABLE IF NOT EXISTS settings (
+	key   text PRIMARY KEY,
+	value jsonb NOT NULL,
+	at    bigint NOT NULL
+);
+
+-- Store sales. A row is a rule, not a price: it says "20% off Collector Boosters"
+-- or "buy two get one free on everything", and the price the store quotes is
+-- derived from whichever active rule is the best deal for that product.
+--
+-- Scope is two nullable columns rather than a pattern language: null means "any",
+-- so (null, null) is a site-wide sale and ('tmp', 'draft') is one product. The
+-- window is nullable at both ends too — a sale with no end runs until it is
+-- switched off.
+CREATE TABLE IF NOT EXISTS sales (
+	id         text PRIMARY KEY,
+	created_at bigint NOT NULL,
+	created_by text,
+	starts_at  bigint,
+	ends_at    bigint,
+	-- 'percent' takes a cut off the price; 'bogo' leaves the price alone and puts
+	-- extra packs in the bag.
+	kind       text NOT NULL CHECK (kind IN ('percent', 'bogo')),
+	percent    integer CHECK (percent > 0 AND percent < 100),
+	buy_qty    integer CHECK (buy_qty > 0),
+	get_qty    integer CHECK (get_qty > 0),
+	set_code   text,
+	pack_type  text,
+	label      text,
+	enabled    boolean NOT NULL DEFAULT true
+);
+CREATE INDEX IF NOT EXISTS sales_enabled_idx ON sales (enabled);
+
+-- Server-wide announcements: the grail pulls and jackpots everyone gets told
+-- about. Capped by the app, newest first.
+--
+-- The player's name is denormalised into the row and there is no foreign key,
+-- for the same reason the audit log has none: "Travis pulled The One Ring 3/50"
+-- is still the thing you want on the board after Travis deletes their account,
+-- and an announcement is a historical fact rather than a view of live data.
+CREATE TABLE IF NOT EXISTS announcements (
+	id       text PRIMARY KEY,
+	at       bigint NOT NULL,
+	kind     text NOT NULL,
+	username text NOT NULL,
+	headline text NOT NULL,
+	detail   text,
+	gold     bigint,
+	image    text
+);
+CREATE INDEX IF NOT EXISTS announcements_at_idx ON announcements (at DESC);
+
 -- Audit trail. Not cascade-deleted from users either: "who deleted that account"
 -- is exactly the entry you still want after the account is gone, so the actor and
 -- target are recorded as plain text rather than as references.

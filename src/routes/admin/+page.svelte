@@ -1,7 +1,7 @@
 <script>
 	import { invalidateAll } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { formatGold, STARTING_GOLD } from '$lib/economy.js';
+	import { formatGold } from '$lib/economy.js';
 	import { PACK_TYPES } from '$lib/packs.js';
 
 	let { data } = $props();
@@ -66,10 +66,129 @@
 		}
 	}
 
+	// ── starting gold ──────────────────────────────────────────
+	let startGold = $state('');
+
+	async function submitStartingGold(amount) {
+		const n = Number(amount ?? startGold);
+		if (!Number.isFinite(n) || n < 0) {
+			err = 'Enter a starting balance.';
+			return;
+		}
+		const r = await call('starting-gold', { amount: n }, 'starting-gold');
+		if (r) {
+			note = `New accounts now start with 🪙${formatGold(r.after)} (was 🪙${formatGold(r.before)}).`;
+			startGold = '';
+		}
+	}
+
+	// ── sales ──────────────────────────────────────────────────
+	let saleKind = $state('percent');
+	let salePercent = $state('20');
+	let saleBuy = $state('1');
+	let saleGet = $state('1');
+	let saleSet = $state('');
+	let saleType = $state('');
+	let saleDays = $state('');
+	let saleLabelText = $state('');
+
+	const saleSetEntry = $derived(data.sets.find((s) => s.code === saleSet) || null);
+	const saleTypes = $derived(
+		saleSet
+			? data.packTypeOrder.filter((t) => (saleSetEntry?.packTypes || []).includes(t))
+			: data.packTypeOrder
+	);
+
+	async function submitSale() {
+		const days = Number(saleDays);
+		const args = {
+			kind: saleKind,
+			setCode: saleSet || null,
+			packType: saleType || null,
+			label: saleLabelText || null,
+			// A duration is friendlier to type than a timestamp; the stored value is
+			// still an absolute instant, so a sale does not drift with the clock.
+			endsAt: Number.isFinite(days) && days > 0 ? Date.now() + days * 86_400_000 : null
+		};
+		if (saleKind === 'percent') args.percent = Number(salePercent);
+		else {
+			args.buyQty = Number(saleBuy);
+			args.getQty = Number(saleGet);
+		}
+		const r = await call('sale', args, 'sale');
+		if (r) {
+			note = `Sale live: ${r.label} on ${r.scope}.`;
+			saleLabelText = '';
+			saleDays = '';
+		}
+	}
+
+	function saleScope(s) {
+		return [s.setCode?.toUpperCase(), s.packType && (PACK_TYPES[s.packType]?.name || s.packType)]
+			.filter(Boolean)
+			.join(' · ') || 'Everything';
+	}
+
+	function saleTerms(s) {
+		if (s.kind === 'percent') return `${s.percent}% off`;
+		return `Buy ${s.buyQty} get ${s.getQty} free`;
+	}
+
 	// ── packs ──────────────────────────────────────────────────
 	let packSet = $state('');
 	let packType = $state('');
 	let packQty = $state('1');
+
+	/**
+	 * The selected player's vault, grouped by product.
+	 *
+	 * Fetched on selection rather than folded into the page load: it is one query
+	 * per account and the panel lists every account, so loading all of them to
+	 * render one would be the mistake the users table exists to avoid. Kept out of
+	 * `call()` because it is a read and must not clear the last action's message.
+	 */
+	let vault = $state(null);
+	let vaultFor = $state(null);
+
+	async function loadVault(userId) {
+		vault = null;
+		vaultFor = userId;
+		try {
+			const res = await fetch('/api/admin', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ action: 'user', user: userId })
+			});
+			if (!res.ok) return;
+			const body = await res.json();
+			// A slower fetch for a previously selected account must not overwrite the
+			// one that is on screen now.
+			if (vaultFor === userId) vault = body.user?.vault ?? [];
+		} catch {
+			/* the remove control simply stays hidden */
+		}
+	}
+
+	let takeKey = $state('');
+	let takeQty = $state('1');
+
+	async function submitTakePacks(all = false) {
+		const [setCode, packTypeId] = takeKey ? takeKey.split(':') : [null, null];
+		const r = await call(
+			'take-packs',
+			{
+				user: selected.id,
+				setCode,
+				packTypeId,
+				...(all ? { all: true } : { qty: Number(takeQty) || 1 })
+			},
+			'take-packs'
+		);
+		if (r) {
+			note = `Removed ${formatGold(r.removed)} pack${r.removed === 1 ? '' : 's'} from ${r.user}.`;
+			await loadVault(selected.id);
+		}
+	}
 
 	const setEntry = $derived(data.sets.find((s) => s.code === packSet) || null);
 	const typesForSet = $derived(
@@ -130,6 +249,11 @@
 		goldAmount = '';
 		newPassword = '';
 		confirmDelete = '';
+		takeKey = '';
+		takeQty = '1';
+		vault = null;
+		vaultFor = null;
+		if (selectedId) loadVault(selectedId);
 	}
 
 	// ── formatting ─────────────────────────────────────────────
@@ -173,6 +297,12 @@
 	const ACTION_LABELS = {
 		gold: '🪙 Gold',
 		packs: '📦 Packs',
+		'packs.remove': '📦 Packs removed',
+		'sale.create': '🏷️ Sale on',
+		'sale.end': '🏷️ Sale off',
+		'sale.resume': '🏷️ Sale resumed',
+		'sale.delete': '🏷️ Sale deleted',
+		'settings.startingGold': '🪙 Starting gold',
 		'admin.grant': '🔑 Admin granted',
 		'admin.revoke': '🔒 Admin revoked',
 		password: '🔐 Password',
@@ -376,6 +506,185 @@
 	</div>
 {/if}
 
+<!-- ── store sales ─────────────────────────────────────────────
+     A sale is a rule, not a price: the store derives what it charges from
+     whichever live rule is the best deal for a product. Two shapes, a percentage
+     off or a buy-one-get-one, and either can be scoped to one set, one product,
+     both, or nothing at all (which means everything). -->
+<div class="card bg-base-100/70 border border-warning/25 mb-4">
+	<div class="card-body p-4 gap-3">
+		<div class="flex items-baseline justify-between gap-2">
+			<h2 class="font-bold text-sm uppercase tracking-wide text-warning">🏷️ Store sales</h2>
+			{#if data.sales.some((s) => s.live)}
+				<button class="btn btn-xs btn-ghost border border-white/10" onclick={() => call('sales-end')} disabled={!!busy}>
+					End all sales
+				</button>
+			{/if}
+		</div>
+
+		<div class="flex flex-wrap items-end gap-2">
+			<div class="join">
+				<button
+					class="btn btn-xs join-item {saleKind === 'percent' ? 'btn-active' : ''}"
+					onclick={() => (saleKind = 'percent')}>% off</button
+				>
+				<button
+					class="btn btn-xs join-item {saleKind === 'bogo' ? 'btn-active' : ''}"
+					onclick={() => (saleKind = 'bogo')}>Buy N get M</button
+				>
+			</div>
+
+			{#if saleKind === 'percent'}
+				<label class="text-xs text-base-content/50">
+					Discount
+					<input class="input input-sm input-bordered w-20 tabular-nums ml-1" type="number" min="1" max="99" bind:value={salePercent} />
+				</label>
+			{:else}
+				<label class="text-xs text-base-content/50">
+					Buy
+					<input class="input input-sm input-bordered w-16 tabular-nums ml-1" type="number" min="1" bind:value={saleBuy} />
+				</label>
+				<label class="text-xs text-base-content/50">
+					Get free
+					<input class="input input-sm input-bordered w-16 tabular-nums ml-1" type="number" min="1" bind:value={saleGet} />
+				</label>
+			{/if}
+
+			<select class="select select-sm select-bordered w-44" bind:value={saleSet}>
+				<option value="">Every set</option>
+				{#each data.sets as s}
+					<option value={s.code}>{s.name} ({s.code.toUpperCase()})</option>
+				{/each}
+			</select>
+			<select class="select select-sm select-bordered w-40" bind:value={saleType}>
+				<option value="">Every product</option>
+				{#each saleTypes as t}
+					<option value={t}>{PACK_TYPES[t]?.name || t}</option>
+				{/each}
+			</select>
+
+			<label class="text-xs text-base-content/50">
+				Days
+				<input class="input input-sm input-bordered w-20 tabular-nums ml-1" type="number" min="1" placeholder="∞" bind:value={saleDays} />
+			</label>
+			<input class="input input-sm input-bordered w-40" type="text" maxlength="60" placeholder="Label (optional)" bind:value={saleLabelText} />
+
+			<button class="btn btn-sm btn-warning font-bold" onclick={submitSale} disabled={busy === 'sale'}>
+				{#if busy === 'sale'}<span class="loading loading-spinner loading-xs"></span>{/if}
+				Start sale
+			</button>
+		</div>
+
+		<p class="text-[0.65rem] text-base-content/40">
+			While a sale runs the counter also pays the sale price — the shop never buys a pack back for
+			more than it is charging for one. Without that, a discount is an unbounded gold printer.
+		</p>
+
+		{#if data.sales.length}
+			<div class="overflow-x-auto">
+				<table class="table table-sm">
+					<thead>
+						<tr class="text-base-content/50">
+							<th>Deal</th>
+							<th>Applies to</th>
+							<th>Status</th>
+							<th></th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each data.sales as s (s.id)}
+							<tr class={s.live ? '' : 'opacity-50'}>
+								<td>
+									<div class="font-semibold">{saleTerms(s)}</div>
+									{#if s.label}<div class="text-[0.65rem] text-base-content/40">“{s.label}”</div>{/if}
+								</td>
+								<td class="text-xs">{saleScope(s)}</td>
+								<td class="text-xs">
+									{#if s.live}
+										<span class="badge badge-xs badge-success font-bold">live</span>
+										{#if s.endsAt}
+											<span class="text-base-content/40">until {when(s.endsAt)}</span>
+										{/if}
+									{:else if s.expired}
+										<span class="badge badge-xs badge-ghost">ended</span>
+									{:else if s.pending}
+										<span class="badge badge-xs badge-info">starts {when(s.startsAt)}</span>
+									{:else}
+										<span class="badge badge-xs badge-ghost">off</span>
+									{/if}
+								</td>
+								<td class="text-right whitespace-nowrap">
+									{#if s.enabled}
+										<button class="btn btn-xs btn-ghost" onclick={() => call('sale-off', { id: s.id })} disabled={!!busy}>
+											Switch off
+										</button>
+									{:else}
+										<button class="btn btn-xs btn-ghost" onclick={() => call('sale-on', { id: s.id })} disabled={!!busy}>
+											Resume
+										</button>
+									{/if}
+									<button
+										class="btn btn-xs btn-ghost text-error"
+										onclick={() => call('sale-off', { id: s.id, delete: true })}
+										disabled={!!busy}>✕</button
+									>
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{:else}
+			<p class="text-sm text-base-content/40">No sales yet. Full price everywhere.</p>
+		{/if}
+	</div>
+</div>
+
+<!-- ── new-account grant ───────────────────────────────────────
+     Only ever applies to the NEXT registration and to a database reset; nobody's
+     existing balance moves. Bumping current players up is what the per-account
+     gold control is for. -->
+<div class="card bg-base-100/70 border border-accent/25 mb-4">
+	<div class="card-body p-4 gap-2">
+		<h2 class="font-bold text-sm uppercase tracking-wide text-accent">🪙 Starting gold</h2>
+		<div class="flex flex-wrap items-center gap-2">
+			<div class="text-sm">
+				New accounts start with
+				<span class="font-black text-accent">🪙 {formatGold(data.summary.startingGold)}</span>
+			</div>
+			<input
+				class="input input-sm input-bordered w-36 tabular-nums"
+				type="number"
+				min="0"
+				step="1000"
+				placeholder="New balance"
+				bind:value={startGold}
+			/>
+			<button
+				class="btn btn-sm btn-accent font-bold"
+				onclick={() => submitStartingGold()}
+				disabled={busy === 'starting-gold' || startGold === ''}
+			>
+				{#if busy === 'starting-gold'}<span class="loading loading-spinner loading-xs"></span>{/if}
+				Apply
+			</button>
+			{#if data.summary.startingGold !== data.summary.defaultStartingGold}
+				<button
+					class="btn btn-sm btn-ghost border border-white/10"
+					onclick={() => submitStartingGold(data.summary.defaultStartingGold)}
+					disabled={!!busy}
+				>
+					Back to 🪙{formatGold(data.summary.defaultStartingGold)}
+				</button>
+			{/if}
+		</div>
+		<p class="text-[0.65rem] text-base-content/40">
+			Applies to the next registration and to what every wallet is set to by a database reset.
+			Existing balances are untouched.
+		</p>
+	</div>
+</div>
+
 <!-- ── accounts ────────────────────────────────────────────── -->
 <div class="flex items-center justify-between gap-3 mb-2">
 	<h2 class="font-bold text-sm uppercase tracking-wide text-base-content/60">
@@ -536,6 +845,45 @@
 						Free of charge, straight into their vault. Products offered are the ones that set
 						really sold.
 					</p>
+
+					<!-- Removal, alongside the grant it undoes. Refunds nothing: this is for
+					     taking something back, not for selling on someone's behalf. -->
+					{#if u.packs > 0}
+						<div class="border-t border-white/10 mt-3 pt-3">
+							<div class="font-bold text-sm mb-2">🗑️ Remove packs</div>
+							{#if vault === null}
+								<div class="text-xs text-base-content/40">
+									<span class="loading loading-spinner loading-xs"></span> Reading their vault…
+								</div>
+							{:else}
+								<div class="flex flex-wrap items-center gap-2">
+									<select class="select select-sm select-bordered w-56" bind:value={takeKey}>
+										<option value="">Every pack they own ({formatGold(u.packs)})</option>
+										{#each vault as v (v.key)}
+											<option value={v.key}>{v.setName} · {v.packName} ({formatGold(v.count)})</option>
+										{/each}
+									</select>
+									<input class="input input-sm input-bordered w-20 tabular-nums" type="number" min="1" bind:value={takeQty} />
+									<button
+										class="btn btn-sm btn-outline btn-error font-bold"
+										onclick={() => submitTakePacks(false)}
+										disabled={busy === 'take-packs'}
+									>
+										{#if busy === 'take-packs'}<span class="loading loading-spinner loading-xs"></span>{/if}
+										Remove
+									</button>
+									<button
+										class="btn btn-sm btn-ghost text-error border border-error/30"
+										onclick={() => submitTakePacks(true)}
+										disabled={busy === 'take-packs'}
+										title="Remove every matching pack"
+									>
+										All
+									</button>
+								</div>
+							{/if}
+						</div>
+					{/if}
 				</div>
 
 				<!-- access -->
@@ -653,7 +1001,8 @@
 			<span class="font-semibold">{formatGold(data.summary.packs)}</span> unopened packs, every rip
 			history, every stat line, all blackjack tables and free spins, and releases the
 			<span class="font-semibold">{formatGold(data.summary.serialsIssued)}</span> issued serial
-			numbers. Every wallet goes back to 🪙 {formatGold(STARTING_GOLD)}.
+			numbers. Every wallet goes back to 🪙 {formatGold(data.summary.startingGold)} — whatever the
+			starting grant is set to above.
 		</p>
 		<p class="text-xs text-base-content/60">
 			The <span class="font-semibold">{formatGold(data.summary.users)}</span> accounts themselves are

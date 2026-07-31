@@ -36,20 +36,26 @@
 		toastTimer = setTimeout(() => (toast = null), 3200);
 	}
 
-	/** One handler for every buy tile — the tile tells us what it just ordered. */
+	/**
+	 * One handler for every buy tile.
+	 *
+	 * The counts come from the SERVER's reply rather than from what the tile
+	 * ordered, because a buy-one-get-one means those two numbers differ — and the
+	 * server is the one that decided how many free units the deal was worth.
+	 */
 	function bought(meta) {
-		return async (result, { qty, packs }) => {
+		return async (result, { qty }) => {
 			buying = null;
 			if (result.type === 'success' && result.data?.success) {
+				const { added, units, freeUnits } = result.data;
+				const bonus = freeUnits ? ` — ${freeUnits} free!` : '';
 				if (meta.kind === 'box') {
 					showToast(
-						`${qty === 1 ? 'Box' : `${qty} boxes`} secured — ${packs.toLocaleString()} packs in your vault.`
+						`${units === 1 ? 'Box' : `${units} boxes`} secured${bonus} · ${added.toLocaleString()} packs in your vault.`
 					);
 				} else {
 					showToast(
-						qty === 1
-							? `${meta.name} added to your vault.`
-							: `${qty} ${meta.name}s added to your vault.`
+						`${added.toLocaleString()} ${meta.name}${added === 1 ? '' : 's'} added to your vault${bonus}`
 					);
 				}
 				await invalidateAll();
