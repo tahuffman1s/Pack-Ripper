@@ -140,7 +140,7 @@
 {/if}
 
 {#if bulk}
-	<MassOpener group={bulk} max={data.massOpenMax} onclose={close} onopened={refreshCounts} />
+	<MassOpener group={bulk} onclose={close} onopened={refreshCounts} />
 {/if}
 
 {#if toast}

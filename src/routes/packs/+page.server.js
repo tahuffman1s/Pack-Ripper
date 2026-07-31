@@ -1,4 +1,4 @@
-import { inventorySummary, getOpenings, MASS_OPEN_MAX } from '$lib/server/game.js';
+import { inventorySummary, getOpenings } from '$lib/server/game.js';
 
 /** @type {import('./$types').PageServerLoad} */
 export async function load({ locals }) {
@@ -9,7 +9,6 @@ export async function load({ locals }) {
 
 	return {
 		groups,
-		recent: recent.slice(0, 6),
-		massOpenMax: MASS_OPEN_MAX
+		recent: recent.slice(0, 6)
 	};
 }

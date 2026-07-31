@@ -12,7 +12,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getCollation, serializedRateOf } from './collation.js';
-import { SERIALIZED_IN_SHEETS } from '../serialized.js';
 
 const CACHE_DIR = join(process.cwd(), '.cache', 'collation');
 const STATS_CACHE = join(CACHE_DIR, '_serialized-stats.json');
@@ -96,7 +95,8 @@ export async function observedSerializedStats() {
 	return data;
 }
 
-/** Whether this set's serialized cards already arrive through collation. */
-export function modelledInSheets(setCode) {
-	return SERIALIZED_IN_SHEETS.has(String(setCode || '').toLowerCase());
-}
+// "Whether this set's serialized cards already arrive through collation" used to
+// be answered here, by a hardcoded set of seven codes. It is answered by
+// sheetsCarrySerialized() in opener.js now, which asks the set's own sheets —
+// the list was missing eleven of the fourteen sets that sheet them. Nothing else
+// consulted it, so it is gone rather than left around to be trusted again.

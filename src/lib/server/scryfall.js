@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -32,12 +32,29 @@ function ensureDirs() {
 	if (!existsSync(ART_DIR)) mkdirSync(ART_DIR, { recursive: true });
 }
 
+/**
+ * Parsed disk caches, held in process.
+ *
+ * Every read used to re-parse the file. A set's print index is up to 1.3 MB of
+ * JSON and a mass rip asks for it once per pack, so a 216-pack rip spent
+ * hundreds of megabytes of JSON.parse re-deriving an object that cannot have
+ * changed. Keyed by path and invalidated by the file's own mtime, so a rebuilt
+ * cache file is still picked up.
+ */
+const parsed = new Map();
+
 function readCache(path) {
 	try {
 		if (!existsSync(path)) return null;
+		const stamp = statSync(path).mtimeMs;
+		const hit = parsed.get(path);
+		if (hit && hit.stamp === stamp) {
+			return Date.now() - hit.fetchedAt > hit.ttl ? null : hit.data;
+		}
 		const { fetchedAt, ttl, data } = JSON.parse(readFileSync(path, 'utf-8'));
-		if (!fetchedAt || Date.now() - fetchedAt > (ttl || CACHE_TTL_MS)) return null;
-		return data;
+		if (!fetchedAt) return null;
+		parsed.set(path, { stamp, fetchedAt, ttl: ttl || CACHE_TTL_MS, data });
+		return Date.now() - fetchedAt > (ttl || CACHE_TTL_MS) ? null : data;
 	} catch {
 		return null;
 	}
@@ -46,6 +63,11 @@ function readCache(path) {
 function writeCache(path, data, ttl) {
 	ensureDirs();
 	writeFileSync(path, JSON.stringify({ fetchedAt: Date.now(), ttl: ttl || undefined, data }));
+	try {
+		parsed.set(path, { stamp: statSync(path).mtimeMs, fetchedAt: Date.now(), ttl: ttl || CACHE_TTL_MS, data });
+	} catch {
+		parsed.delete(path);
+	}
 }
 
 async function apiGet(path) {
@@ -161,9 +183,17 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * Resolve specific cards by Scryfall id via POST /cards/collection.
  * Max 75 identifiers per request, and one malformed id fails the whole batch
  * with a 400, so ids are shape-checked first.
+ *
+ * `answered` is the subset of ids Scryfall actually gave a verdict on — a batch
+ * lost to a network error or a 5xx is absent from it. That is the difference
+ * between "this printing does not exist" and "we could not ask", which matters
+ * to the caller: only the former is worth remembering.
+ *
+ * @returns {Promise<{cards:Record<string,object>, answered:Set<string>}>}
  */
 export async function getCardsByIds(ids) {
-	const out = {};
+	const cards = {};
+	const answered = new Set();
 	const valid = [...new Set(ids)].filter((id) => UUID_RE.test(id));
 	for (let i = 0; i < valid.length; i += 75) {
 		const batch = valid.slice(i, i + 75);
@@ -175,13 +205,14 @@ export async function getCardsByIds(ids) {
 			});
 			if (!res.ok) continue;
 			const body = await res.json();
-			for (const c of body.data || []) out[c.id] = normalizeCard(c);
+			for (const c of body.data || []) cards[c.id] = normalizeCard(c);
+			for (const id of batch) answered.add(id);
 		} catch {
 			/* skip this batch; caller falls back */
 		}
 		if (i + 75 < valid.length) await sleep(750);
 	}
-	return out;
+	return { cards, answered };
 }
 
 /**
@@ -202,22 +233,42 @@ function loadById() {
 	return byIdMemo;
 }
 
+/**
+ * Ids Scryfall has confirmed it does not have. Without this, an id MTGJSON knows
+ * and Scryfall does not is re-requested on every single lookup, forever — which
+ * for a mass rip means one pointless round trip per pack.
+ *
+ * Only confirmed absences go in here, never a failed request: tombstoning an id
+ * because Scryfall was briefly down would strip that card's art for the rest of
+ * the process. In-process only, so a restart is a fair moment to ask again in
+ * case the printing has since landed.
+ */
+const byIdMisses = new Set();
+
 export async function resolveCardsByIds(ids) {
 	const store = loadById();
 	const out = {};
 	const missing = [];
 	for (const id of new Set(ids)) {
 		if (store[id]) out[id] = store[id];
-		else missing.push(id);
+		else if (!byIdMisses.has(id)) missing.push(id);
 	}
 	if (missing.length) {
-		const fetched = await getCardsByIds(missing);
+		const { cards, answered } = await getCardsByIds(missing);
 		let changed = false;
-		for (const [id, card] of Object.entries(fetched)) {
-			out[id] = card;
-			store[id] = card;
-			changed = true;
+		for (const id of missing) {
+			const card = cards[id];
+			if (card) {
+				out[id] = card;
+				store[id] = card;
+				changed = true;
+			} else if (answered.has(id)) {
+				byIdMisses.add(id);
+			}
 		}
+		// The store is several megabytes, so it is serialised once per call and
+		// only when the call actually learnt something. Callers that need many
+		// ids should ask for them in one call rather than one at a time.
 		if (changed) {
 			try {
 				ensureDirs();

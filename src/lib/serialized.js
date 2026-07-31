@@ -24,22 +24,34 @@
  * that way are flagged estimated:true and labelled as such in the UI.
  */
 
-/** Sets whose serialized cards already come out of MTGJSON collation. */
-export const SERIALIZED_IN_SHEETS = new Set(['brr', 'bro', 'rvr', 'mom', 'mul', 'ltr', 'ltc']);
+/**
+ * Products whose MTGJSON sheet weights encode the print run.
+ *
+ * Tales of Middle-earth is the informative case. Its three serialized Sol Rings
+ * were printed in runs of 300, 700 and 900, and their sheet weights are 3, 9 and
+ * 7 — the run divided by 100. The weight IS the run, so there is no need to guess
+ * from card names.
+ *
+ * Both codes are here because the cards and the packs disagree about which set
+ * they belong to: the Sol Rings ride LTR Collector Booster sheets but MTGJSON
+ * files them under LTC, the Commander companion set. Matching on 'ltr' alone
+ * meant the weight rule never fired for the three cards it was written for.
+ */
+const RUN_IN_SHEET_WEIGHT = new Set(['ltr', 'ltc']);
 
 /**
- * Print run for a serialized card that came off a real MTGJSON sheet.
+ * Print run for a serialized card.
  *
- * LTR is the informative case. Its three serialized Sol Rings were printed in
- * runs of 300, 700 and 900, and MTGJSON's sheet weights for them are 3, 9 and
- * 7 — the run divided by 100. The sheet weight IS the print run, so there is
- * no need to guess from card names. The One Ring is a genuine 1-of-1 and sits
- * alone on its own weight-1 sheet.
+ * `setCode` is the product the sheet belongs to, since that is what qualifies
+ * `sheetWeight`. `fallbackRun` is the observed median for everything else — no
+ * other set publishes a run anywhere, and a serialized card with no run cannot
+ * be given a number at all, so callers that want one must supply it. The One
+ * Ring is a genuine 1-of-1 and sits alone on its own weight-1 sheet.
  */
 export function serialRunFor(setCode, card, sheetWeight, fallbackRun) {
 	if (/^The One Ring$/i.test(card?.name || '')) return 1;
 	const code = String(setCode || '').toLowerCase();
-	if (code === 'ltr' && sheetWeight > 0) return sheetWeight * 100;
+	if (RUN_IN_SHEET_WEIGHT.has(code) && sheetWeight > 0) return sheetWeight * 100;
 	return fallbackRun || null;
 }
 

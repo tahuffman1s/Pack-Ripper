@@ -8,7 +8,7 @@ import {
 	valuesClause
 } from './rows.js';
 import { COLLECTION_VALUE_SQL } from './economySql.js';
-import { generatePack, rollSerialized } from './opener.js';
+import { generatePack, rollSerialized, warmForRip } from './opener.js';
 import { pickSerial, serializedFloorUsd } from '../serialized.js';
 import { boxSizesFor, productsAvailable } from './collation.js';
 import { lastKnownPackEv, packEvUsd, isVintage } from './packvalue.js';
@@ -392,11 +392,31 @@ export async function buy(userId, { setCode, packTypeId, kind, qty = 1 }) {
  *
  * Runs inside the caller's transaction, so serials are only ever consumed by a
  * rip that actually gets banked. Rolling back a failed opening puts them back.
+ *
+ * EVERY serialized card in the pack comes through here, whichever way it got
+ * into the pack: off an MTGJSON print sheet during collation, or layered on top
+ * afterwards for the sets MTGJSON has no serialized sheet for (see
+ * rollSerialized). Both arrive with a print run and no number, and both claim
+ * that number here — the layered ones used to arrive pre-numbered and skip this
+ * function entirely, which meant nothing was ever written to the ledger for them
+ * and the same number could be handed to any number of players.
+ *
+ * A card that cannot be given a number is handled by where it came from:
+ *
+ *   * A SHEET card fills a slot, and the slot still has to hold something, so it
+ *     becomes the plain foil printing it would have been.
+ *   * A LAYERED card is an extra on top of the pack, so it is dropped. Grafting
+ *     it into the pack as a bonus foil rare would mean an exhausted print run
+ *     started paying out a free extra card in every pack.
+ *
+ * @returns {object[]} the cards that belong in the pack — the input list, minus
+ *   any layered serialized card whose run had nothing left.
  */
 async function assignSerials(client, cards) {
 	const serialized = cards.filter((c) => c.serialOf && c.serial == null);
-	if (!serialized.length) return;
+	if (!serialized.length) return cards;
 	const now = Date.now();
+	const dropped = new Set();
 
 	for (const c of serialized) {
 		let claimed = null;
@@ -417,17 +437,27 @@ async function assignSerials(client, cards) {
 			if (rowCount) claimed = n;
 		}
 
-		if (claimed == null) {
-			// Whole run claimed — downgrade to the plain foil printing.
+		if (claimed != null) {
+			c.serial = claimed;
+			c.valueUsd = Number(serializedFloorUsd(c.serialOf, c.valueUsd).toFixed(2));
+		} else if (!c.sheet) {
+			// Layered: no sheet put this card in the pack, so nothing is left short
+			// by it not being there.
+			dropped.add(c);
+		} else {
+			// On a sheet — downgrade to the plain foil printing. Its price has to come
+			// back down with it: makeInstance floored the value by scarcity on the way
+			// in, and a card that is no longer serialized is not worth a serialized
+			// card's floor.
+			c.valueUsd = c.baseUsd ?? c.valueUsd;
 			c.serialOf = null;
 			c.slot = 'rare';
 			c.slotLabel = 'Foil Rare / Mythic';
 			c.tier = 6.5;
-		} else {
-			c.serial = claimed;
-			c.valueUsd = Number(serializedFloorUsd(c.serialOf, c.valueUsd).toFixed(2));
 		}
 	}
+
+	return dropped.size ? cards.filter((c) => !dropped.has(c)) : cards;
 }
 
 /**
@@ -542,8 +572,9 @@ async function commitOpenings(client, userId, opened, now) {
 
 	for (const { item, pack } of banked) {
 		// Serials are claimed here rather than at roll time so that a rip which
-		// never commits does not consume 137/250 on its way out.
-		await assignSerials(client, pack.cards);
+		// never commits does not consume 137/250 on its way out. This can shorten
+		// the pack, so the result is what everything below counts.
+		pack.cards = await assignSerials(client, pack.cards);
 		for (const c of pack.cards) {
 			c.acquiredAt = now;
 			c.sold = false;
@@ -555,7 +586,11 @@ async function commitOpenings(client, userId, opened, now) {
 	await insertCards(client, userId, cards);
 	await writeStats(client, userId, s);
 
-	const summaries = banked.map(({ item, pack }) => [
+	// Only the most recent OPENINGS_KEPT survive the prune below, so a batch
+	// bigger than that logs its tail and nothing else. Writing all of a
+	// ten-thousand-pack rip here would mean 80,000 bound parameters — past
+	// Postgres's 65,535 ceiling — for rows that are deleted two statements later.
+	const summaries = banked.slice(-OPENINGS_KEPT).map(({ item, pack }) => [
 		makeId(),
 		userId,
 		now,
@@ -604,19 +639,100 @@ export async function openPack(userId, inventoryId) {
 	return { ok: true, pack, gold: (await getWallet(userId)).gold };
 }
 
-/** Hard ceiling on one mass rip — a case of Play Boosters is 216 packs. */
-export const MASS_OPEN_MAX = 216;
+/**
+ * Packs rolled and banked per transaction during a mass rip.
+ *
+ * A rip has no size limit, so it cannot be one transaction: ten thousand packs
+ * is 150,000 cards, which is more than is sensible to hold in memory, hold a
+ * row lock over, or lose in one go if the connection drops. Chunking bounds all
+ * three, makes progress durable as it happens, and gives the await points that
+ * keep the rest of the server responsive while a big rip runs.
+ */
+const RIP_CHUNK = 100;
 
 /**
- * Rip many packs at once. Packs are drawn from the caller's inventory matching
- * `setCode`/`packTypeId` (or from the front of the vault when neither is given),
- * rolled one at a time so collation and pricing caches warm normally, then
- * banked in a single transaction.
+ * How many cards a rip reports back, most valuable first.
+ *
+ * A rip of any size has to fit in one HTTP response, and 150,000 cards do not —
+ * the counts stay exact regardless, this only bounds the pictures. The cards
+ * kept are the priciest, so every rare, mythic, foil and serialized pull from a
+ * rip of ordinary size is in here and only bulk commons fall off the end. Five
+ * hundred is comfortably more than the ~300 hits in a 216-pack case, which is
+ * the largest rip that used to be allowed at all.
+ */
+const RIP_CARDS_SHOWN = 500;
+
+const marketOf = (c) => cardMarketGold(c.valueUsd);
+
+/**
+ * Running totals for a rip, kept instead of the cards themselves.
+ *
+ * The old code accumulated every card and let the client tally them, which is
+ * fine for 216 packs and impossible for an unbounded rip. Everything the summary
+ * screen shows is counted here as packs are banked, in constant memory, and the
+ * top pulls are kept as a bounded leaderboard.
+ */
+function newRipTally() {
+	return {
+		packsOpened: 0,
+		cardCount: 0,
+		valueGold: 0,
+		mythics: 0,
+		rares: 0,
+		foils: 0,
+		treatments: 0,
+		serialized: 0,
+		estimated: false,
+		top: []
+	};
+}
+
+function foldIntoTally(t, banked) {
+	for (const { pack } of banked) {
+		t.packsOpened++;
+		if (pack.estimated) t.estimated = true;
+		for (const c of pack.cards) {
+			t.cardCount++;
+			const g = cardMarketGold(c.valueUsd);
+			t.valueGold += g;
+			if (c.rarity === 'mythic') t.mythics++;
+			else if (c.rarity === 'rare') t.rares++;
+			if (c.foil) t.foils++;
+			if (c.treatments?.length) t.treatments++;
+			if (c.serial != null) t.serialized++;
+			// Insertion into a list held at RIP_CARDS_SHOWN, so the cost per card is
+			// a comparison against the current cut-off rather than a sort at the end.
+			if (t.top.length < RIP_CARDS_SHOWN) {
+				t.top.push(c);
+				if (t.top.length === RIP_CARDS_SHOWN) t.top.sort((a, b) => marketOf(b) - marketOf(a));
+			} else if (g > marketOf(t.top[t.top.length - 1])) {
+				let i = t.top.length - 1;
+				while (i > 0 && marketOf(t.top[i - 1]) < g) {
+					t.top[i] = t.top[i - 1];
+					i--;
+				}
+				t.top[i] = c;
+			}
+		}
+	}
+}
+
+/**
+ * Rip a stack of packs. Unbounded: `count` may be every pack the player owns.
+ *
+ * Packs are drawn from the caller's inventory matching `setCode`/`packTypeId`
+ * (or from the front of the vault when neither is given). The data every pack in
+ * the stack needs is fetched once up front, then packs are rolled and banked in
+ * chunks of RIP_CHUNK.
+ *
+ * `onProgress` is called after each chunk commits, with the tally so far — the
+ * route uses it to stream a live count to the browser.
  *
  * @param {string} userId
- * @param {{setCode?:string, packTypeId?:string, ids?:string[], count?:number}} opts
+ * @param {{setCode?:string, packTypeId?:string, ids?:string[], count?:number,
+ *          onProgress?:(t:object)=>void}} opts
  */
-export async function openPacks(userId, { setCode, packTypeId, ids, count } = {}) {
+export async function openPacks(userId, { setCode, packTypeId, ids, count, onProgress } = {}) {
 	const wanted = Array.isArray(ids) && ids.length;
 	const { rows } = wanted
 		? await query(
@@ -633,39 +749,66 @@ export async function openPacks(userId, { setCode, packTypeId, ids, count } = {}
 			);
 
 	let queue = rows.map(packFromRow);
-	const n = Math.min(queue.length, Math.max(1, Number(count) || queue.length), MASS_OPEN_MAX);
-	queue = queue.slice(0, n);
+	const asked = Math.floor(Number(count));
+	if (Number.isFinite(asked) && asked > 0) queue = queue.slice(0, asked);
 	if (!queue.length) return { ok: false, error: 'No packs to open.' };
 
+	// Every distinct set/type in the queue, warmed before the first roll. Usually
+	// one — the mass opener rips one stack at a time.
+	for (const key of new Set(queue.map((i) => `${i.setCode}:${i.packTypeId}`))) {
+		const [code, type] = key.split(':');
+		await warmForRip(code, type);
+	}
+
 	const issuedFor = await issuedLookup();
-	const opened = [];
+	const tally = newRipTally();
 	const failed = [];
-	for (const item of queue) {
-		let pack = null;
-		try {
-			pack = await rollPack(item, issuedFor);
-		} catch {
-			pack = null;
+	let alreadyOpen = 0;
+	const total = queue.length;
+
+	for (let i = 0; i < queue.length; i += RIP_CHUNK) {
+		const chunk = queue.slice(i, i + RIP_CHUNK);
+		const opened = [];
+		for (const item of chunk) {
+			let pack = null;
+			try {
+				pack = await rollPack(item, issuedFor);
+			} catch {
+				pack = null;
+			}
+			if (pack) opened.push({ item, pack });
+			else failed.push(item.setCode.toUpperCase());
 		}
-		if (pack) opened.push({ item, pack });
-		else failed.push(item.setCode.toUpperCase());
-	}
-	if (!opened.length) {
-		return { ok: false, error: `Card data for ${[...new Set(failed)].join(', ')} is unavailable.` };
+		if (!opened.length) continue;
+
+		const banked = await tx((client) => commitOpenings(client, userId, opened, Date.now()));
+		alreadyOpen += opened.length - banked.length;
+		foldIntoTally(tally, banked);
+		onProgress?.({
+			total,
+			packsOpened: tally.packsOpened,
+			cardCount: tally.cardCount,
+			valueGold: tally.valueGold,
+			mythics: tally.mythics,
+			rares: tally.rares
+		});
 	}
 
-	const banked = await tx((client) => commitOpenings(client, userId, opened, Date.now()));
-	if (!banked.length) return { ok: false, error: 'Those packs are already open.' };
+	if (!tally.packsOpened) {
+		return failed.length
+			? { ok: false, error: `Card data for ${[...new Set(failed)].join(', ')} is unavailable.` }
+			: { ok: false, error: 'Those packs are already open.' };
+	}
 
-	const cards = banked.flatMap((o) => o.pack.cards);
+	const { top, ...counts } = tally;
 	return {
 		ok: true,
-		packsOpened: banked.length,
+		...counts,
 		// Packs whose set has no usable card data are left in the vault, not lost.
-		skipped: failed.length + (opened.length - banked.length),
-		estimated: banked.some((o) => o.pack.estimated),
-		cards,
-		valueGold: cards.reduce((a, c) => a + cardMarketGold(c.valueUsd), 0),
+		skipped: failed.length + alreadyOpen,
+		// A rip smaller than RIP_CARDS_SHOWN never hit the sort in foldIntoTally.
+		cards: top.sort((a, b) => marketOf(b) - marketOf(a)),
+		truncated: tally.cardCount > top.length,
 		gold: (await getWallet(userId)).gold
 	};
 }

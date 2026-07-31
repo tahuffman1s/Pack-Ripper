@@ -269,9 +269,14 @@ async function buildSlice(code) {
 }
 
 /**
- * Probability that a pack of this variant contains a serialized card,
- * computed from the sheets. Six sets model serialized cards this way; for them
- * no estimate is needed at all.
+ * Probability that a pack of this variant contains a serialized card, computed
+ * from the sheets.
+ *
+ * A non-zero answer means no estimate is needed for this product at all — the
+ * collation deals them itself. That is also exactly how opener.js decides whether
+ * to layer one on top, so this doubles as the test for "does MTGJSON model
+ * serialized cards here". Far more sets say yes than the seven a hardcoded list
+ * used to name.
  */
 export function serializedRateOf(slice, variantKey) {
 	const v = slice?.variants?.[variantKey];

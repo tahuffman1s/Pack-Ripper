@@ -1,10 +1,10 @@
 import { makeId } from './db.js';
 import { PACK_TYPES, VARIANT_PREFERENCE, isExcludedVariant, eraTemplate, SLOT_LABELS } from '../packs.js';
 import { generateFromVariant, makeRng } from '../collate.js';
-import { getCollation, cardSlotKind, slotTier, labelFor } from './collation.js';
+import { getCollation, cardSlotKind, slotTier, labelFor, serializedRateOf } from './collation.js';
 import { getAllSets, getSetPool, getSetPrints, resolveCardsByIds, poolIsUsable } from './scryfall.js';
 import { pickSerial, serializedFloorUsd, serialRunFor, isSerializedCard } from '../serialized.js';
-import { observedSerializedStats, modelledInSheets } from './serializedStats.js';
+import { observedSerializedStats } from './serializedStats.js';
 import { nearestCollation, structureOf, pickStructureConfig } from './neighbour.js';
 import { treatmentsOf } from '../cards.js';
 
@@ -56,8 +56,13 @@ function valueOf(card, finish) {
 function makeInstance(card, { finish, slot, slotLabel, tier, sheet, fromSet, serial, serialOf, estimated }) {
 	const foil = finish === 'foil' || finish === 'etched';
 	const treatments = treatmentsOf(card);
-	let value = valueOf(card, finish);
-	if (serialOf) value = serializedFloorUsd(serialOf, value);
+	const base = valueOf(card, finish);
+	// A serialized card is priced by scarcity rather than by any listing (see
+	// serializedFloorUsd). The unfloored price is kept alongside it because a card
+	// that turns out not to be serialized after all — its print run was already
+	// claimed out, so game.js downgrades it to the plain foil printing — has to be
+	// worth what that plain printing is worth, not what a 1-of-500 is worth.
+	const value = serialOf ? serializedFloorUsd(serialOf, base) : base;
 
 	return {
 		uid: makeId(),
@@ -85,7 +90,10 @@ function makeInstance(card, { finish, slot, slotLabel, tier, sheet, fromSet, ser
 		serial: serial ?? null,
 		serialOf: serialOf ?? null,
 		estimated: !!estimated,
-		valueUsd: Number((value || 0).toFixed(2))
+		valueUsd: Number((value || 0).toFixed(2)),
+		// Only carried while a serial floor is in play; every other card's price is
+		// already its own base price.
+		...(serialOf ? { baseUsd: Number((base || 0).toFixed(2)) } : {})
 	};
 }
 
@@ -162,6 +170,13 @@ function sortForReveal(cards) {
 
 // ── The real path ──────────────────────────────────────────────
 
+/**
+ * Look up the Scryfall printing for every card in `picked`.
+ *
+ * Returns a lookup function rather than a merged object: the set index runs to
+ * a few thousand printings and spreading it into a fresh object once per pack
+ * is a copy of the whole set to answer fifteen questions.
+ */
 async function resolvePrints(picked, slice) {
 	const packSet = slice.setCode.toLowerCase();
 	const local = [];
@@ -176,8 +191,8 @@ async function resolvePrints(picked, slice) {
 	// Anything the set crawl missed, plus every companion-set card, resolves
 	// individually and is cached by id.
 	const stillMissing = [...foreign, ...local.filter((id) => !index[id])];
-	const extra = stillMissing.length ? await resolveCardsByIds(stillMissing) : {};
-	return { ...index, ...extra };
+	const extra = stillMissing.length ? await resolveCardsByIds(stillMissing) : null;
+	return (id) => (extra && extra[id]) || index[id] || null;
 }
 
 async function generateFromCollation(slice, packTypeId, rng) {
@@ -188,15 +203,35 @@ async function generateFromCollation(slice, packTypeId, rng) {
 	const { picked } = generateFromVariant(variant, { rng, facts: slice.cards });
 	if (!picked.length) return null;
 
-	const prints = await resolvePrints(picked, slice);
+	const printFor = await resolvePrints(picked, slice);
 	const packSet = slice.setCode.toLowerCase();
+
+	/**
+	 * Print run for any serialized card in this pack.
+	 *
+	 * Only LTR encodes the run in its sheet weights; for every other set
+	 * serialRunFor has nothing to go on and needs the observed median passed in.
+	 * Without it `serialOf` came back null, and a serialized card with no print
+	 * run is one game.js cannot number — so BRO's 63, MOM's 70 and WHO's 13
+	 * serialized printings all arrived labelled "Serialized", unnumbered, and
+	 * absent from the ledger. Fetched only when a pack actually contains one
+	 * (memoised after the first call, but the check is a handful of comparisons
+	 * and this runs for every pack of every rip).
+	 */
+	const anySerialized = picked.some((p) => {
+		const fact = slice.cards[p.uuid];
+		if (!fact) return false;
+		return (fact.p || []).includes('serialized') || isSerializedCard(fact.s ? printFor(fact.s) : null);
+	});
+	const fallbackRun = anySerialized ? (await observedSerializedStats().catch(() => null))?.run ?? null : null;
+
 	const cards = [];
 
 	for (const p of picked) {
 		const fact = slice.cards[p.uuid];
 		if (!fact) continue;
 		const sheet = variant.sheets[p.sheet];
-		let card = fact.s ? prints[fact.s] : null;
+		let card = fact.s ? printFor(fact.s) : null;
 
 		// Join failure: fall back to what MTGJSON itself knows about the card so
 		// the slot is still filled with the right card, just without art.
@@ -226,13 +261,24 @@ async function generateFromCollation(slice, packTypeId, rng) {
 		}
 
 		const isForeign = (fact.e || '').toLowerCase() !== packSet;
-		// Six sets put serialized cards on real sheets, so they arrive here at
-		// exactly the published rate. The serial NUMBER is assigned later by
+		// Sets that put serialized cards on real sheets deliver them here, at
+		// exactly the rate the sheet gives. The serial NUMBER is assigned later by
 		// game.js, which owns the issued-serial ledger.
-		const serialized = isSerializedCard(card) || (fact.p || []).includes('serialized');
-		const serialOf = serialized
-			? serialRunFor(fact.e || packSet, card, sheet?.cards?.[p.uuid] ?? 0)
+		//
+		// A print run is a precondition, not a detail: game.js can only number a
+		// card it knows the run of, so a serialized printing with no run would be
+		// labelled "Serialized" and then never numbered, never ledgered, and never
+		// scarcity-priced. If the run cannot be determined the card stands as the
+		// ordinary premium card its slot called for, which is honest, rather than
+		// as a serialized card that is missing everything that makes it one.
+		const isSerialPrinting = isSerializedCard(card) || (fact.p || []).includes('serialized');
+		// The pack's set, not the card's: the weight being interpreted came off this
+		// pack's sheet, and a serialized card is routinely filed under a companion
+		// set (LTR's Sol Rings are LTC cards on LTR sheets).
+		const serialOf = isSerialPrinting
+			? serialRunFor(packSet, card, sheet?.cards?.[p.uuid] ?? 0, fallbackRun)
 			: null;
+		const serialized = isSerialPrinting && !!serialOf;
 
 		// Some sets carry the basic on the common sheet; it is still the land slot.
 		const isBasic = /^Basic (Snow )?Land/i.test(card.typeLine || fact.t || '');
@@ -672,7 +718,94 @@ export async function generatePack(setCode, packTypeId, opts = {}) {
 }
 
 /**
- * Serialized cards for sets MTGJSON does not put on a sheet.
+ * Fetch everything a run of identical packs will ask for, before the first one
+ * is rolled.
+ *
+ * Rolling a pack is a fraction of a millisecond of arithmetic once its data is
+ * in memory. What made a mass rip slow was the data arriving one pack at a
+ * time: the token slot draws a *random* token and tokens resolve by id, so with
+ * ~30 tokens in a set the first thirty packs of a rip each blocked on their own
+ * Scryfall round trip, in series. Those same ids cost one request when asked
+ * for together, which is the bulk of what this does.
+ *
+ * The throwaway roll at the end covers the paths that are awkward to enumerate
+ * — the art-card companion set, a Jumpstart release's front cards, the
+ * neighbour search a set with no booster data of its own falls back to. Rolling
+ * a pack is pure (serials are claimed later, by game.js), so discarding one
+ * costs nothing but warms whichever of those this rip is going to use.
+ *
+ * Best-effort throughout: anything that fails here simply fails again inside
+ * the roll, where it is already handled.
+ */
+export async function warmForRip(setCode, packTypeId) {
+	const code = String(setCode).toLowerCase();
+	let slice = null;
+	try {
+		slice = await getCollation(code);
+	} catch {
+		/* the roll falls back to the Scryfall pool */
+	}
+
+	if (slice) {
+		await getSetPrints(code).catch(() => null);
+		// One request for every token in the set, rather than one per pack until
+		// the set's whole token list happens to have been drawn. Collector,
+		// Mystery and Jumpstart boosters carry no token, so they skip it.
+		if (packTypeId !== 'collector' && packTypeId !== 'mystery' && packTypeId !== 'jumpstart') {
+			const ids = (slice.tokens || []).map((t) => t?.s).filter(Boolean);
+			if (ids.length) await resolveCardsByIds(ids).catch(() => null);
+		}
+	} else {
+		await getSetPool(code).catch(() => null);
+	}
+	if (packTypeId === 'collector') await observedSerializedStats().catch(() => null);
+
+	await generatePack(code, packTypeId, {}).catch(() => null);
+}
+
+/**
+ * Does this product's own collation already deal serialized cards?
+ *
+ * Asked of the sheets rather than of a list of set codes. There WAS a list —
+ * SERIALIZED_IN_SHEETS, seven hardcoded codes — and it was wrong for eleven of
+ * the fourteen sets that actually sheet them: WHO, MKM, PIP, MH3, ACR, DFT, TDM,
+ * ECL, FIN, INR and SOS all collate serialized cards AND, because they were
+ * missing from the list, had another layered on top. WHO dealt them at 1% from
+ * its sheets plus 0.75% layered, so nearly half of its serialized pulls were
+ * ones the product does not contain. A list of set codes is the wrong shape for
+ * this question — every new set with serialized cards would have to be added to
+ * it, and nothing fails loudly when one is not.
+ *
+ * Memoised per set and product: serializedRateOf walks every sheet of every
+ * booster configuration, which is far too much work to repeat for each pack of a
+ * rip. A slice rebuilt mid-process keeps the old answer until restart, which is
+ * the same trade nearestCollation makes and costs nothing while a set's sheets
+ * are not changing under us.
+ */
+const sheetSerialized = new Map();
+
+async function sheetsCarrySerialized(code, packTypeId) {
+	const key = `${code}:${packTypeId}`;
+	if (sheetSerialized.has(key)) return sheetSerialized.get(key);
+
+	let carries = false;
+	try {
+		const slice = await getCollation(code);
+		const variantKey = slice ? variantForProduct(slice, packTypeId) : null;
+		// No slice at all is the case this whole path exists for: a set too new for
+		// MTGJSON to have built booster data, whose serialized cards can only be
+		// layered on.
+		carries = !!variantKey && serializedRateOf(slice, variantKey) > 0;
+	} catch {
+		carries = false;
+	}
+
+	sheetSerialized.set(key, carries);
+	return carries;
+}
+
+/**
+ * Serialized cards for sets whose collation does not deal them.
  *
  * Which cards exist comes from Scryfall (`promo_types` contains "serialized").
  * How often they appear, and how long the print run is, come from the median of
@@ -681,14 +814,24 @@ export async function generatePack(setCode, packTypeId, opts = {}) {
  * the drop rates for other treatments", which is explicit licence to layer them
  * on top rather than fold them into the published slot percentages.
  *
- * Called by game.js, which owns the issued-serial ledger.
+ * The card comes back WITHOUT a number: it has a print run (`serialOf`) but no
+ * `serial`. Deciding which of the 500 this one is belongs to game.js, which owns
+ * the ledger and can claim a number under a primary key. Picking it here used to
+ * look like it worked — `issuedFor` is a real snapshot of the ledger — but a
+ * number picked and never recorded is a number the next pack can pick again, and
+ * within one mass rip the snapshot does not move at all. So the run length is
+ * settled here and the number is not.
+ *
+ * `issuedFor` still decides whether to offer a card at all, which is worth doing
+ * cheaply here: a run with nothing left produces no serialized card rather than
+ * one that game.js has to throw away.
  */
 export async function rollSerialized(setCode, packTypeId, issuedFor, rng = Math.random) {
 	const code = String(setCode).toLowerCase();
-	// Sets MTGJSON models already produced their serialized cards in collation.
-	if (modelledInSheets(code)) return null;
 	// Serialized cards have only ever ridden in Collector Boosters.
 	if (packTypeId !== 'collector') return null;
+	// This product's own sheets already deal them — nothing to layer on.
+	if (await sheetsCarrySerialized(code, packTypeId)) return null;
 
 	const prints = await getSetPrints(code);
 	const candidates = Object.values(prints).filter(isSerializedCard);
@@ -699,16 +842,19 @@ export async function rollSerialized(setCode, packTypeId, issuedFor, rng = Math.
 
 	const card = pick(candidates, rng);
 	const of = serialRunFor(code, card, 0, stats.run);
-	const serial = pickSerial(issuedFor(card.id), of, rng);
-	if (serial == null) return null; // the whole print run is claimed
+	// Only a "is there anything left at all" test — see above.
+	if (pickSerial(issuedFor(card.id), of, rng) == null) return null;
 
 	return makeInstance(card, {
 		finish: (card.finishes || []).includes('etched') ? 'etched' : 'foil',
 		slot: 'serialized',
 		slotLabel: 'Serialized',
 		tier: 9,
+		// No sheet, because MTGJSON does not put this card on one. That absence is
+		// also what tells game.js this card rides on top of the pack rather than
+		// filling one of its slots, which changes how a failed claim is handled.
 		sheet: null,
-		serial,
+		serial: null,
 		serialOf: of,
 		estimated: true
 	});
