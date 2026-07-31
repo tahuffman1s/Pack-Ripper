@@ -1,7 +1,7 @@
 <script>
 	import { invalidateAll } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { formatGold } from '$lib/economy.js';
+	import { formatGold, STARTING_GOLD } from '$lib/economy.js';
 	import { PACK_TYPES } from '$lib/packs.js';
 
 	let { data } = $props();
@@ -152,6 +152,24 @@
 		return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
 	}
 
+	// ── database reset ─────────────────────────────────────────
+	// The word has to be typed exactly, and the server insists on it too — the
+	// disabled button is a courtesy, not the guard (see RESET_CONFIRM in admin.js).
+	const RESET_WORD = 'RESET';
+	let confirmReset = $state('');
+
+	async function submitReset() {
+		if (confirmReset !== RESET_WORD) return;
+		const r = await call('db-reset', { confirm: RESET_WORD }, 'db-reset');
+		confirmReset = '';
+		if (r?.ok) {
+			note =
+				`Database reset — wiped ${formatGold(r.cardsWiped)} cards and ${formatGold(r.packsWiped)} packs, ` +
+				`released ${formatGold(r.serialsReleased)} serials, and set ${formatGold(r.accountsKept)} ` +
+				`wallet(s) to 🪙 ${formatGold(r.goldEach)}.`;
+		}
+	}
+
 	const ACTION_LABELS = {
 		gold: '🪙 Gold',
 		packs: '📦 Packs',
@@ -161,7 +179,8 @@
 		logout: '🚪 Signed out',
 		'stats.reset': '📊 Stats reset',
 		unstick: '🔧 Unstuck',
-		delete: '🗑️ Deleted'
+		delete: '🗑️ Deleted',
+		'db.reset': '♻️ Database reset'
 	};
 </script>
 
@@ -210,6 +229,65 @@
 		</div>
 	{/each}
 </div>
+
+<!-- ── version ─────────────────────────────────────────────────
+     What is actually running. The commit is the useful part: `latest` says
+     nothing about which build it currently resolves to, so after a push this is
+     how you tell whether the Pi has picked the new image up yet. -->
+{#if data.summary.version}
+	{@const v = data.summary.version}
+	<div class="card bg-base-100/40 border border-white/5 mb-3">
+		<div class="card-body p-3 gap-2 text-xs">
+			<div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+				<span class="font-bold text-sm">🏷️ Version</span>
+
+				{#if v.version}
+					<span class="badge badge-sm badge-neutral font-mono font-bold">v{v.version}</span>
+				{/if}
+
+				{#if v.shortCommit}
+					<a
+						class="font-mono font-bold link link-hover"
+						href="https://github.com/tahuffman1s/Pack-Ripper/commit/{v.commit}"
+						target="_blank"
+						rel="noreferrer"
+						title={v.commit}>{v.shortCommit}</a
+					>
+					{#if v.ref}
+						<span class="text-base-content/50">on <span class="font-mono">{v.ref}</span></span>
+					{/if}
+				{:else}
+					<span class="text-warning font-semibold">unknown</span>
+					<span class="text-base-content/50">
+						— built without <span class="font-mono">GIT_SHA</span>, and there is no git checkout here
+						to read it from.
+					</span>
+				{/if}
+
+				{#if v.source === 'image'}
+					<span class="badge badge-sm badge-success badge-outline font-semibold">image</span>
+				{:else if v.source === 'git'}
+					<span class="badge badge-sm badge-info badge-outline font-semibold">working copy</span>
+				{/if}
+
+				{#if v.dirty}
+					<span
+						class="badge badge-sm badge-warning font-bold"
+						title="Uncommitted changes — this is not exactly the commit named above"
+					>
+						modified
+					</span>
+				{/if}
+
+				{#if v.builtAt}
+					<span class="text-base-content/50">built {ago(Date.parse(v.builtAt))}</span>
+				{:else if v.committedAt}
+					<span class="text-base-content/50">committed {ago(Date.parse(v.committedAt))}</span>
+				{/if}
+			</div>
+		</div>
+	</div>
+{/if}
 
 <div class="card bg-base-100/40 border border-white/5 mb-4">
 	<div class="card-body p-3 gap-1 text-xs text-base-content/60">
@@ -561,6 +639,47 @@
 		<div class="card-body p-4 text-sm text-base-content/50">Pick an account above to act on it.</div>
 	</div>
 {/if}
+
+<!-- ── danger zone ─────────────────────────────────────────────
+     Whole-database actions, kept away from the per-account controls above so a
+     misplaced click on the wrong panel cannot reach them. -->
+<div class="card border border-error/30 bg-error/5 mb-4">
+	<div class="card-body p-4 gap-2">
+		<h2 class="font-bold text-sm uppercase tracking-wide text-error">Danger zone</h2>
+
+		<div class="font-bold text-sm">♻️ Reset every player's progress</div>
+		<p class="text-xs text-base-content/60">
+			Wipes all <span class="font-semibold">{formatGold(data.summary.cards)}</span> cards,
+			<span class="font-semibold">{formatGold(data.summary.packs)}</span> unopened packs, every rip
+			history, every stat line, all blackjack tables and free spins, and releases the
+			<span class="font-semibold">{formatGold(data.summary.serialsIssued)}</span> issued serial
+			numbers. Every wallet goes back to 🪙 {formatGold(STARTING_GOLD)}.
+		</p>
+		<p class="text-xs text-base-content/60">
+			The <span class="font-semibold">{formatGold(data.summary.users)}</span> accounts themselves are
+			kept — passwords, admin flags and sessions all survive, so nobody is signed out and nobody has
+			to register again. This cannot be undone.
+		</p>
+
+		<div class="flex flex-wrap items-center gap-2 mt-1">
+			<input
+				class="input input-sm input-bordered w-44"
+				type="text"
+				autocomplete="off"
+				placeholder="Type {RESET_WORD}"
+				bind:value={confirmReset}
+			/>
+			<button
+				class="btn btn-sm btn-error font-bold"
+				onclick={submitReset}
+				disabled={busy === 'db-reset' || confirmReset !== RESET_WORD}
+			>
+				{#if busy === 'db-reset'}<span class="loading loading-spinner loading-xs"></span>{/if}
+				Reset database
+			</button>
+		</div>
+	</div>
+</div>
 
 <!-- ── audit ───────────────────────────────────────────────── -->
 <div class="card bg-base-100/70 border border-white/5">

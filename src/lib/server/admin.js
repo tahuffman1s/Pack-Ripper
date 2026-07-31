@@ -28,6 +28,8 @@ import {
 } from './auth.js';
 import { setEntry, storeSets } from './registry.js';
 import { packTypeById } from '../packs.js';
+import { STARTING_GOLD } from '../economy.js';
+import { versionInfo } from './version.js';
 import { addPacks, getStats, getOpenings, packPriceGold, MAX_BUY_PACKS } from './game.js';
 
 /**
@@ -182,6 +184,9 @@ export async function summary() {
 		tablesOpen: r.tables_open,
 		uptimeSeconds: Math.round(process.uptime()),
 		nodeVersion: process.version,
+		// What is actually running here — see version.js for why this cannot just
+		// be read off the image tag.
+		version: versionInfo(),
 		tokenAuth: tokenAuthEnabled(),
 		// Which database this is, how big it is, and whether the pool is healthy.
 		storage: await dbStatus()
@@ -467,6 +472,69 @@ async function actionLog(actor, args) {
 	return { ok: true, log: await auditLog(args.limit ?? 50) };
 }
 
+/** The word a caller has to send to prove a database reset is deliberate. */
+export const RESET_CONFIRM = 'RESET';
+
+/**
+ * Wipe every player's progress, keeping the accounts themselves.
+ *
+ * Collections, vaults, rip histories, stats, blackjack tables and free spins all
+ * go, and every wallet returns to the starting balance. Accounts, passwords and
+ * sessions survive, so nobody is logged out and nobody has to register again —
+ * everyone simply starts over. admin_log survives too, because the entry saying
+ * this happened is the one you most want afterwards.
+ *
+ * `serials` IS cleared here, which is the opposite of what deleting one account
+ * does, and the difference is the point. Releasing #137/250 when its owner leaves
+ * would let a second one exist alongside the first; releasing it when every card
+ * in the database is being destroyed leaves nothing for it to duplicate. The
+ * ledger is only meaningful next to the cards it was issued to, and after this
+ * there are none.
+ *
+ * TRUNCATE rather than DELETE: nothing has a foreign key pointing AT these
+ * tables, so there is no cascade to worry about, and it does not care how many
+ * rows it is removing — the point of this button is a database that has had
+ * 300,000 cards ripped into it.
+ */
+async function actionResetDatabase(actor, args) {
+	if (String(args.confirm || '') !== RESET_CONFIRM) {
+		return {
+			ok: false,
+			error: `This wipes every player's cards, packs, stats and gold. Send confirm="${RESET_CONFIRM}" to go ahead.`
+		};
+	}
+
+	// The figures for the audit entry, read before they stop existing.
+	const before = await summary();
+
+	await tx(async (client) => {
+		await client.query(
+			'TRUNCATE collections, inventory, openings, stats, blackjack, free_spins, serials'
+		);
+		// Not TRUNCATE: the row per account has to stay, at the balance a new
+		// account starts with. A player with no wallet row reads as zero gold and
+		// could not buy their first pack.
+		await client.query('UPDATE wallets SET gold = $1', [STARTING_GOLD]);
+	});
+
+	await record(
+		actor,
+		'db.reset',
+		null,
+		`wiped ${before.cards} cards, ${before.packs} packs, ${before.serialsIssued} serials across ` +
+			`${before.users} account(s); wallets set to ${STARTING_GOLD}`
+	);
+
+	return {
+		ok: true,
+		accountsKept: before.users,
+		cardsWiped: before.cards,
+		packsWiped: before.packs,
+		serialsReleased: before.serialsIssued,
+		goldEach: STARTING_GOLD
+	};
+}
+
 /**
  * The dispatch table. Action names are the CLI's vocabulary and the panel's
  * button wiring both — adding an entry here is the whole job of adding a command.
@@ -483,7 +551,8 @@ const HANDLERS = {
 	logout: actionLogout,
 	'reset-stats': actionResetStats,
 	unstick: actionUnstick,
-	delete: actionDelete
+	delete: actionDelete,
+	'db-reset': actionResetDatabase
 };
 
 export const ACTION_NAMES = Object.keys(HANDLERS);

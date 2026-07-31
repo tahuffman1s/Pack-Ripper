@@ -72,6 +72,12 @@ COPY --from=docker.io/cloudflare/cloudflared:2026.7.3 /usr/local/bin/cloudflared
 COPY --from=build /app/build ./build
 COPY --from=deps /app/node_modules ./node_modules
 
+# The manifest, for the version the admin panel reports. It also states
+# "type": "module" for everything under /app, which until now was inferred:
+# adapter-node emits ESM into build/ and Node 22 guesses right by sniffing the
+# syntax. Saying it outright costs nothing and does not rely on that guess.
+COPY package.json ./package.json
+
 # The admin CLI, for a host with no copy of the repo — a `docker exec` into a Pi,
 # above all. A dependency-free script that talks to the app over loopback; it
 # carries no privileges of its own and does nothing without ADMIN_TOKEN set.
@@ -108,6 +114,22 @@ ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \
     SHUTDOWN_TIMEOUT=5
+
+# Which commit this image is, so the admin panel can answer "what is deployed?".
+# It has to come in as a build arg: the image carries no git checkout, and a
+# container cannot read the tag it was pulled under — `latest` in particular says
+# nothing about which build it currently resolves to. Left empty by a plain
+# `docker build`, which the panel reports honestly as an unknown version rather
+# than guessing. The image workflow passes all three; see build-args there.
+#
+# Last in the file on purpose. These change on every commit, so anything below
+# them would lose its layer cache on every build.
+ARG GIT_SHA=""
+ARG GIT_REF=""
+ARG BUILD_TIME=""
+ENV GIT_SHA=$GIT_SHA \
+    GIT_REF=$GIT_REF \
+    BUILD_TIME=$BUILD_TIME
 
 # Only the app. cloudflared publishes nothing — it dials out — and its metrics
 # port is bound to loopback inside the container.

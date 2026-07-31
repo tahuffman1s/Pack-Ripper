@@ -74,7 +74,8 @@ Repair
   delete <user> --yes               delete the account and everything on it
 
 Server
-  status                            health, totals, uptime
+  status                            version, health, totals, uptime
+  db-reset --confirm RESET          wipe every player's progress, keep accounts
   log [n]                           the admin audit trail (default 30)
   token                             generate a value for ADMIN_TOKEN
 
@@ -316,6 +317,26 @@ async function cmdDelete() {
 	);
 }
 
+/**
+ * Wipe every player's progress. The word is spelled out rather than accepted as
+ * a --yes flag, because --yes is muscle memory and this is not the command to
+ * lose an argument-order argument with.
+ */
+async function cmdDbReset() {
+	if (flags.confirm !== 'RESET') {
+		die(
+			'refusing to reset without --confirm RESET.',
+			'usage: db-reset --confirm RESET   (wipes all cards, packs, stats and gold; keeps accounts)'
+		);
+	}
+	const r = await api('db-reset', { confirm: 'RESET' });
+	if (maybeJson(r)) return;
+	ok(
+		`database reset — wiped ${num(r.cardsWiped)} cards and ${num(r.packsWiped)} packs, released ` +
+			`${num(r.serialsReleased)} serials, set ${num(r.accountsKept)} wallet(s) to ${num(r.goldEach)} gold.`
+	);
+}
+
 async function cmdLog() {
 	const { log } = await api('log', { limit: Number(args[0]) || 30 });
 	if (maybeJson({ log })) return;
@@ -342,6 +363,18 @@ async function cmdStatus() {
 
 	console.log(`${c.b}${BASE}${c.n}`);
 	console.log(`  health        ${health?.ok ? `${c.g}ok${c.n}` : `${c.y}no answer on /api/health${c.n}`}`);
+	// Which build answered. The first line to read after a deploy: `latest` says
+	// nothing about which image a host has actually pulled.
+	const v = summary.version;
+	if (v) {
+		const commit = v.shortCommit || `${c.y}unknown${c.n}`;
+		const marks = [v.ref, v.source === 'git' ? 'working copy' : null, v.dirty ? `${c.y}modified${c.n}` : null]
+			.filter(Boolean)
+			.join(', ');
+		console.log(`  version       ${v.version ? `v${v.version} ` : ''}${commit}${marks ? `  (${marks})` : ''}`);
+		const stamp = v.builtAt || v.committedAt;
+		if (stamp) console.log(`                ${v.builtAt ? 'built' : 'committed'} ${when(Date.parse(stamp))}`);
+	}
 	console.log(`  node          ${summary.nodeVersion}`);
 	console.log(`  uptime        ${Math.floor(summary.uptimeSeconds / 3600)}h ${Math.floor((summary.uptimeSeconds % 3600) / 60)}m`);
 	console.log(`  accounts      ${num(summary.users)} (${num(summary.admins)} admin)`);
@@ -414,6 +447,7 @@ const COMMANDS = {
 	unstick: cmdUnstick,
 	'reset-stats': cmdResetStats,
 	delete: cmdDelete,
+	'db-reset': cmdDbReset,
 	log: cmdLog,
 	status: cmdStatus,
 	token: cmdToken,
